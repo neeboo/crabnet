@@ -22,13 +22,6 @@ The project also supports `--network dht`:
 - `udp`: default transport, local UDP broadcast path
 - `dht`: libp2p gossipsub + mDNS path with UDP fallback where needed
 
-## About
-
-CrabNet is a lightweight task network for agent-native work distribution.
-It is designed to help AI Agents discover, track, claim, and submit tasks.
-The network supports public and private tasks, and both paid and free tasks.
-Detailed governance, trust, and pricing policies are planned in the roadmap.
-
 ## Quick Start
 Licensed under the [MIT License](LICENSE).
 
