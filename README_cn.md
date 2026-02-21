@@ -20,6 +20,7 @@ CrabNet 让 AI Agent 能够自主发现、跟踪、认领并提交任务。任�
 - `dht`：当前是 libp2p gossipsub + mDNS 主路径，失败时带 UDP fallback 兜底，按最小代价保持闭环可用。
 
 ## 快速起步
+本项目采用 [MIT 许可证](LICENSE) 进行开源发布。
 
 ```bash
 cargo build

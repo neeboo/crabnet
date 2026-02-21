@@ -23,6 +23,7 @@ The project also supports `--network dht`:
 - `dht`: libp2p gossipsub + mDNS path with UDP fallback where needed
 
 ## Quick Start
+Licensed under the [MIT License](LICENSE).
 
 ```bash
 cargo build
