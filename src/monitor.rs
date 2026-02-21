@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use std::sync::mpsc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -33,7 +33,7 @@ pub struct MonitorEvent {
 #[derive(Clone)]
 pub struct MonitorHandle {
     node_id: String,
-    sender: Option<mpsc::UnboundedSender<MonitorEvent>>,
+    sender: Option<mpsc::SyncSender<MonitorEvent>>,
 }
 
 impl MonitorHandle {
@@ -49,7 +49,7 @@ impl MonitorHandle {
                 source,
                 payload: serde_json::to_value(payload).unwrap_or(Value::Null),
             };
-            let _ = tx.send(event);
+            let _ = tx.try_send(event);
         }
     }
 
@@ -62,27 +62,24 @@ impl MonitorHandle {
             };
         };
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<MonitorEvent>();
-        tokio::spawn(async move {
-            match OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .await
-            {
-                Ok(mut file) => {
-                    while let Some(event) = rx.recv().await {
-                        match serde_json::to_string(&event) {
-                            Ok(raw) => {
-                                let line = format!("{}\n", raw);
-                                let _ = file.write_all(line.as_bytes()).await;
-                                let _ = file.flush().await;
-                            }
-                            Err(_) => {}
-                        }
-                    }
+        const MONITOR_CHANNEL_CAP: usize = 8192;
+        let (tx, rx) = mpsc::sync_channel::<MonitorEvent>(MONITOR_CHANNEL_CAP);
+        std::thread::spawn(move || {
+            let file = OpenOptions::new().create(true).append(true).open(path);
+            let mut file = match file {
+                Ok(file) => file,
+                Err(_) => {
+                    while rx.recv().is_ok() {}
+                    return;
                 }
-                Err(_) => while rx.recv().await.is_some() {},
+            };
+
+            while let Ok(event) = rx.recv() {
+                if let Ok(raw) = serde_json::to_string(&event) {
+                    let line = format!("{raw}\n");
+                    let _ = file.write_all(line.as_bytes());
+                    let _ = file.flush();
+                }
             }
         });
 

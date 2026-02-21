@@ -1,94 +1,100 @@
 # Crabnet Backend Hardening Roadmap
 
-> Current baseline: 2026-02-21
-> Goal: keep protocol compatibility while making node behavior more predictable, recoverable, and resilient to misuse.
+> Baseline: 2026-02-21
+> Rule: keep unfinished work first; completed work moves to evidence section.
 
-## Milestone 0 (Highest Priority Fixes)
+## Top Priority TODO (Unfinished First)
 
-- [ ] Add robust persistence consistency and recovery for state load/save
-  - Task: Add durability checks after atomic rename and validate saved file checksum.
-  - Task: Implement fallback recovery to a backup copy (e.g. `.bak`) when load fails, and emit explicit monitor alerts.
-  - Task: Add path/file locking strategy for `state.json` and monitor writes to prevent concurrent process corruption.
+### P0 - State Safety and Execution Containment
 
-- [ ] Strengthen message deduplication and reject handling
-  - Task: Replace unbounded `seen_messages` with bounded windowing + persistent pruning for TTL cleanup.
-  - Task: Make message TTL configurable and log effective value on startup.
-  - Task: Distinguish reject reasons in `apply_remote`: duplicate, expired, and malformed payload.
+- [ ] Add monitor writer file lock
+  - Task: prevent concurrent `events.ndjson` writers.
+  - Task: fail fast with explicit error when lock cannot be acquired.
 
-- [ ] Reduce high-risk execution paths
-  - Task: Add command allowlist / command length / working directory restrictions in `runner`.
-  - Task: On timeout, explicitly terminate task process and record termination metadata.
-  - Task: Bound stdout/stderr capture size and truncate outputs to prevent log growth abuse.
+### P2 - Deterministic State Convergence
 
-## Milestone 1 (Security and Identity)
+- [ ] Define seed conflict convergence rules
+  - Task: add explicit ordering/versioning for remote seed updates.
+  - Task: resolve settle/result/claim cross-node conflicts deterministically.
 
-- [x] Add hybrid post-quantum-capable message transport for broadcast payloads.
-  - Task: add `Envelope.crypto` recipient entries and hybrid key agreement (`x25519` ephemeral + `Kyber768` KEM) during broadcast.
-  - Task: derive session keys via HKDF and encrypt payloads with `ChaCha20-Poly1305`.
-  - Task: support local fallback for peers without identity/keys and for legacy plaintext messages.
-  - Task: onboard peers through `NodeHello` containing static `x25519` and `Kyber768` public keys.
+- [ ] Add lifecycle timeout/expiry enforcement
+  - Task: background sweeper for expired `Open` seeds.
+  - Task: promote timed-out running seeds to terminal status with monitor alert.
 
-- [x] Add sender identity and signature verification
-  - Task: define and store dual signature algorithm metadata on `Envelope`.
-  - Task: add Ed25519 + Dilithium2 signatures for outbound envelopes.
-  - Task: verify sender identity for all remote messages and reject unauthenticated senders.
+- [ ] Add transaction-like run/settle write discipline
+  - Task: define atomic transition boundary for `Running -> Done -> Settled`.
+  - Task: add replayable audit checkpoints for claim/result/settle transitions.
 
-- [ ] Add API auth model for monitor endpoints
-  - Task: add optional token or header-based gate for `/api/*` endpoints.
-  - Task: keep `/health` public, protect all other endpoints by default.
+### P3 - Operator Visibility and Tooling
 
-- [ ] Add network path rate limiting and abuse prevention
-  - Task: cap send frequency for UDP and DHT broadcasts.
-  - Task: add source-level fast-fail threshold, and drop/ignore after sustained misuse.
+- [ ] Add hardening metrics
+  - Task: counters for reject/noop/drop/replay outcomes.
+  - Task: monitor lag/backlog indicators for event pipeline.
 
-## Milestone 2 (Data Consistency)
+- [ ] Improve event query scalability and API consistency
+  - Task: avoid full-file scans for common `/api/events` queries.
+  - Task: standardize invalid-query error responses.
 
-- [ ] Define deterministic seed state convergence
-  - Task: add version vector or update timestamp for seed updates.
-  - Task: resolve `seed` update conflicts (remote settle vs local claim/result) with monotonic order rules.
+- [ ] Add operator preflight/inspection commands
+  - Task: `--verify-config` for path/addr/writeability checks.
+  - Task: `--dump-topology` CLI output for incident triage.
 
-- [ ] Handle expiry and timeouts
-  - Task: background job to move stale bidable seeds to `Expired`.
-  - Task: mark long-running executions as failed on timeout and emit monitoring alerts.
+### P4 - Protocol Evolution (Compatibility-Preserving)
 
-- [ ] Transaction-like behavior for run/settle
-  - Task: keep `seed run` and `add_result` as a single business write path.
-  - Task: add checkpoint + replayable audit for settlement, claim, and result updates.
+- [ ] DHT hardening parameters
+  - Task: split topic/version strategy for forward compatibility.
+  - Task: add bootstrap fallback strategy using cached peers.
 
-## Milestone 3 (Operations Observability)
+- [ ] Snapshot/event evolution
+  - Task: add minimal delta exports to reduce full payload churn.
+  - Task: version snapshot schema for cross-version replay safety.
 
-- [ ] Metrics and alerting
-  - Task: emit counters/gauges for message ingest, reject, drop, and replay.
-  - Task: add lag and backlog health signals for monitor file and sync queue.
+### Acceptance Criteria (Open)
 
-- [ ] Hardening API behavior
-  - Task: improve event pagination and filtering for `/api/events` to avoid full-file scans.
-  - Task: unify invalid query handling into consistent API errors.
+- [ ] Signature failures, duplicate messages, and TTL-expired messages are surfaced with explicit operator-facing diagnostics.
+- [ ] Multi-process state write scenarios fail safely without silent corruption.
+- [ ] All high-impact hardening knobs are configurable and observable at startup.
 
-- [ ] Operator tools
-  - Task: add `--verify-config` to precheck network addresses, directory permissions, and writable output paths.
-  - Task: add `--dump-topology` CLI for faster incident investigation.
+## Completed in This Branch (Evidence)
 
-## Milestone 4 (Protocol and Platform)
+- [x] State corruption recovery (checksum + backup fallback) is implemented.
+  - Evidence: `src/store.rs` (`save`, `load`, `StoreLoadRecoverySignal`), `src/main.rs` emits `store_load_recovery_fallback`.
 
-- [ ] DHT production parameters
-  - Task: separate publish/subscribe topics and version topics.
-  - Task: add bootstrap and listener validation fallback to cached peers on repeated failures.
+- [x] `state.json` write lock coordination is implemented.
+  - Evidence: `src/store.rs` (`state.json.lock`, `acquire_state_lock`).
 
-- [ ] Snapshot and event evolution
-  - Task: introduce minimal delta exports to reduce full state broadcast churn.
-  - Task: add snapshot version markers for cross-version compatibility.
+- [x] Remote dedupe memory growth is bounded and TTL-configurable.
+  - Evidence: `src/store.rs` (`seen_messages` prune + `CRABNET_MESSAGE_TTL_SECONDS`), startup log in `src/main.rs`.
 
-## Milestone 5 (Acceptance Criteria)
+- [x] Runner execution guardrails are implemented.
+  - Evidence: `src/runner.rs` (allowlist/workdir/timeout kill/output caps), `tests/runner_hardening.rs`.
 
-- [ ] Full flow `publish -> bid -> claim -> run -> settle` is stable and consistent across at least two nodes over UDP and DHT.
-- [ ] Known failure cases (missing signature, duplicate envelope, TTL expiration, concurrent writes) are all visible via monitor events and explicit rejection reason.
-- [ ] State directory write failures stop operation with explicit errors; no silent corruption or data loss.
-- [ ] All high-impact hardening knobs are configurable (signature requirement, API token, timeout, rate limits).
+- [x] Monitor API auth gate is implemented with public `/health`.
+  - Evidence: `src/web.rs` (`ApiAuthConfig`, `api_auth_guard`), web tests.
 
-## Open Items
+- [x] Network abuse controls are implemented.
+  - Evidence: `src/network.rs` (rate limiter + source fast-fail), network tests.
 
-- Sandbox/isolated execution (containerized or jailed)
-- Centralized identity trust store (key distribution and revocation)
-- Multi-tenant namespace isolation
-- End-to-end integrity chain for cross-region propagation
+- [x] Operator preflight/inspection commands are implemented.
+  - Evidence: `src/main.rs` (`--verify-config`, `--dump-topology`), `tests/cli_alignment.rs`.
+
+- [x] Hybrid post-quantum-capable payload protection is implemented.
+  - Evidence: `src/store.rs` (`encrypt_for_peers`, `build_recipient_envelope`, `decrypt_payload`, `derive_session_key`).
+
+- [x] Dual-signature envelope authenticity and sender verification are implemented.
+  - Evidence: `src/store.rs` (`sign_envelope`, `verify_envelope`, `verify_with_identity`, `verify_ed25519_signature`, `verify_dilithium2_signature`).
+
+- [x] Signed `NodeHello` identity onboarding is implemented.
+  - Evidence: `src/main.rs` listener startup sends `Envelope::node_hello`; `src/store.rs` `MessageKind::NodeHello` apply path and identity checks.
+
+- [x] Remote apply noop/reject categorization is implemented.
+  - Evidence: `src/store.rs` `ApplyRemoteNoopReason`; `src/main.rs` monitor events `store_sync_noop` and `store_sync_rejected`.
+
+- [x] UDP fragmentation/reassembly and DHT UDP fallback path are implemented.
+  - Evidence: `src/network.rs` (`send_udp_payload`, `maybe_reassemble_fragment`, `fallback_send`).
+
+- [x] Two-node full flow stability is covered for both UDP and DHT.
+  - Evidence: `tests/cli_e2e.rs` (`cli_e2e_dual_node_udp_sync_publish_bid`, `cli_e2e_dual_node_dht_sync_publish_bid_claim_run_settle`).
+
+- [x] Atomic state write path with parseable concurrent-save regression coverage is implemented.
+  - Evidence: `src/store.rs` (`save` temp-file + `sync_all` + rename), store tests `concurrent_saves_keep_state_json_parsable` and `save_overwrites_and_loads_without_corruption`.

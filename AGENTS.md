@@ -43,6 +43,22 @@ This enables:
 - code review support
 - deeper reasoning
 
+### 3. Branch to PR Workflow (Blocking)
+All changes must follow this sequence:
+
+1. Create a branch from the latest `main`.
+2. Implement and validate changes on that branch.
+3. Run relevant tests before opening a PR.
+4. Open a PR targeting `main`.
+5. Request review from `@codex`.
+6. Post a PR comment with `@codex review this`.
+7. Address all review feedback and rerun review until it passes.
+8. Merge only after `@codex` approval and required checks pass.
+
+Rules:
+- Direct commits to `main` are not allowed.
+- Merging without `@codex` review pass is not allowed.
+
 ---
 
 ## Execution Checklist

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::net::UdpSocket;
@@ -57,6 +58,8 @@ struct UdpTransport {
     announce_addr: String,
     monitor: MonitorHandle,
     fragments: HashMap<String, UdpFragmentState>,
+    outbound_rate_limiter: Option<BroadcastRateLimiter>,
+    inbound_source_guard: Option<UdpSourceFastFailGuard>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +90,7 @@ struct DhtTransport {
     announce_addr: String,
     fallback_udp: Option<UdpSocket>,
     monitor: MonitorHandle,
+    outbound_rate_limiter: Option<BroadcastRateLimiter>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -102,6 +106,197 @@ const UDP_MAX_DATAGRAM: usize = 1200;
 const UDP_FRAGMENT_TTL_SECONDS: u64 = 30;
 const UDP_FRAGMENT_SEND_ATTEMPTS: usize = 3;
 const UDP_FRAGMENT_RESEND_DELAY_MS: u64 = 10;
+const BROADCAST_WINDOW_MILLIS: u64 = 1_000;
+const UDP_RATE_LIMIT_ENV: &str = "CRABNET_UDP_BROADCASTS_PER_SEC";
+const DHT_RATE_LIMIT_ENV: &str = "CRABNET_DHT_BROADCASTS_PER_SEC";
+const UDP_SOURCE_FAST_FAIL_THRESHOLD_ENV: &str = "CRABNET_UDP_SOURCE_FAST_FAIL_THRESHOLD_PER_SEC";
+const UDP_SOURCE_BLOCK_MS_ENV: &str = "CRABNET_UDP_SOURCE_BLOCK_MS";
+const UDP_SOURCE_TRACK_MAX: usize = 4_096;
+
+#[derive(Clone, Copy, Debug)]
+struct AbusePreventionConfig {
+    udp_broadcasts_per_sec: usize,
+    dht_broadcasts_per_sec: usize,
+    udp_source_fast_fail_threshold_per_sec: usize,
+    udp_source_block_ms: u64,
+}
+
+impl AbusePreventionConfig {
+    fn from_env() -> Self {
+        Self {
+            // 0 means disabled for backwards compatibility.
+            udp_broadcasts_per_sec: parse_env_usize(UDP_RATE_LIMIT_ENV, 0),
+            // 0 means disabled for backwards compatibility.
+            dht_broadcasts_per_sec: parse_env_usize(DHT_RATE_LIMIT_ENV, 0),
+            // 0 means disabled for backwards compatibility.
+            udp_source_fast_fail_threshold_per_sec: parse_env_usize(
+                UDP_SOURCE_FAST_FAIL_THRESHOLD_ENV,
+                0,
+            ),
+            // Keep block duration short by default in case users enable threshold.
+            udp_source_block_ms: parse_env_u64(UDP_SOURCE_BLOCK_MS_ENV, 3_000),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BroadcastRateLimiter {
+    limit: usize,
+    window: Duration,
+    state: Mutex<BroadcastRateLimiterState>,
+}
+
+#[derive(Debug)]
+struct BroadcastRateLimiterState {
+    window_start: Instant,
+    seen: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BroadcastRateDecision {
+    Allow,
+    Block { retry_after: Duration },
+}
+
+impl BroadcastRateLimiter {
+    fn new(limit: usize, window: Duration) -> Option<Self> {
+        if limit == 0 {
+            return None;
+        }
+
+        Some(Self {
+            limit,
+            window,
+            state: Mutex::new(BroadcastRateLimiterState {
+                window_start: Instant::now(),
+                seen: 0,
+            }),
+        })
+    }
+
+    fn check(&self, now: Instant) -> BroadcastRateDecision {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if now.duration_since(state.window_start) >= self.window {
+            state.window_start = now;
+            state.seen = 0;
+        }
+
+        if state.seen < self.limit {
+            state.seen += 1;
+            BroadcastRateDecision::Allow
+        } else {
+            let elapsed = now.duration_since(state.window_start);
+            let retry_after = self.window.saturating_sub(elapsed);
+            BroadcastRateDecision::Block { retry_after }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct UdpSourceFastFailGuard {
+    threshold_per_window: usize,
+    window: Duration,
+    block_for: Duration,
+    states: HashMap<String, UdpSourceFastFailState>,
+}
+
+#[derive(Debug)]
+struct UdpSourceFastFailState {
+    window_start: Instant,
+    seen: usize,
+    blocked_until: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UdpSourceDecision {
+    Allow,
+    DropBlocked {
+        retry_after: Duration,
+    },
+    DropThresholdExceeded {
+        threshold_per_window: usize,
+        block_for: Duration,
+    },
+}
+
+impl UdpSourceFastFailGuard {
+    fn from_config(config: AbusePreventionConfig) -> Option<Self> {
+        if config.udp_source_fast_fail_threshold_per_sec == 0 {
+            return None;
+        }
+
+        Some(Self {
+            threshold_per_window: config.udp_source_fast_fail_threshold_per_sec,
+            window: Duration::from_millis(BROADCAST_WINDOW_MILLIS),
+            block_for: Duration::from_millis(config.udp_source_block_ms),
+            states: HashMap::new(),
+        })
+    }
+
+    fn check(&mut self, source: &SocketAddr, now: Instant) -> UdpSourceDecision {
+        if self.states.len() > UDP_SOURCE_TRACK_MAX {
+            self.states.retain(|_, state| {
+                state
+                    .blocked_until
+                    .map(|until| until > now)
+                    .unwrap_or_else(|| now.duration_since(state.window_start) <= self.window)
+            });
+        }
+
+        let key = source.ip().to_string();
+        let state = self
+            .states
+            .entry(key)
+            .or_insert_with(|| UdpSourceFastFailState {
+                window_start: now,
+                seen: 0,
+                blocked_until: None,
+            });
+
+        if let Some(until) = state.blocked_until {
+            if until > now {
+                return UdpSourceDecision::DropBlocked {
+                    retry_after: until.duration_since(now),
+                };
+            }
+            state.blocked_until = None;
+        }
+
+        if now.duration_since(state.window_start) >= self.window {
+            state.window_start = now;
+            state.seen = 0;
+        }
+
+        state.seen = state.seen.saturating_add(1);
+        if state.seen > self.threshold_per_window {
+            state.blocked_until = Some(now + self.block_for);
+            state.seen = 0;
+            return UdpSourceDecision::DropThresholdExceeded {
+                threshold_per_window: self.threshold_per_window,
+                block_for: self.block_for,
+            };
+        }
+
+        UdpSourceDecision::Allow
+    }
+}
+
+fn parse_env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn parse_env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
 
 impl MeshClient {
     pub async fn new(
@@ -299,6 +494,7 @@ impl UdpTransport {
         announce_addr: String,
         monitor: MonitorHandle,
     ) -> Result<Self> {
+        let abuse_config = AbusePreventionConfig::from_env();
         monitor
             .emit(
                 "udp_sender_init",
@@ -318,6 +514,11 @@ impl UdpTransport {
             announce_addr,
             monitor,
             fragments: HashMap::new(),
+            outbound_rate_limiter: BroadcastRateLimiter::new(
+                abuse_config.udp_broadcasts_per_sec,
+                Duration::from_millis(BROADCAST_WINDOW_MILLIS),
+            ),
+            inbound_source_guard: None,
         })
     }
 
@@ -327,6 +528,7 @@ impl UdpTransport {
         _bootstrap_peers: Vec<String>,
         monitor: MonitorHandle,
     ) -> Result<Self> {
+        let abuse_config = AbusePreventionConfig::from_env();
         monitor
             .emit(
                 "udp_listener_init",
@@ -347,10 +549,32 @@ impl UdpTransport {
             announce_addr: String::new(),
             monitor,
             fragments: HashMap::new(),
+            outbound_rate_limiter: BroadcastRateLimiter::new(
+                abuse_config.udp_broadcasts_per_sec,
+                Duration::from_millis(BROADCAST_WINDOW_MILLIS),
+            ),
+            inbound_source_guard: UdpSourceFastFailGuard::from_config(abuse_config),
         })
     }
 
     pub async fn broadcast(&self, msg: Envelope) -> Result<()> {
+        if let Some(limiter) = &self.outbound_rate_limiter {
+            if let BroadcastRateDecision::Block { retry_after } = limiter.check(Instant::now()) {
+                self.monitor
+                    .emit(
+                        "udp_rate_limited",
+                        EventSource::Network,
+                        serde_json::json!({
+                            "limit_per_sec": limiter.limit,
+                            "retry_after_ms": retry_after.as_millis(),
+                            "announce_addr": self.announce_addr,
+                        }),
+                    )
+                    .await;
+                return Err(anyhow!("udp broadcast rate limited"));
+            }
+        }
+
         let data = serde_json::to_string(&msg)?;
         let mut sent = false;
         let mut sent_count = 0usize;
@@ -394,6 +618,46 @@ impl UdpTransport {
         let mut buf = vec![0u8; 65536];
         loop {
             if let Ok((n, from)) = self.socket.recv_from(&mut buf).await {
+                if let Some(guard) = self.inbound_source_guard.as_mut() {
+                    match guard.check(&from, Instant::now()) {
+                        UdpSourceDecision::Allow => {}
+                        UdpSourceDecision::DropBlocked { retry_after } => {
+                            self.monitor
+                                .emit(
+                                    "udp_inbound_fast_fail_drop",
+                                    EventSource::Network,
+                                    serde_json::json!({
+                                        "from": from.to_string(),
+                                        "source": from.ip().to_string(),
+                                        "reason": "blocked",
+                                        "retry_after_ms": retry_after.as_millis(),
+                                    }),
+                                )
+                                .await;
+                            continue;
+                        }
+                        UdpSourceDecision::DropThresholdExceeded {
+                            threshold_per_window,
+                            block_for,
+                        } => {
+                            self.monitor
+                                .emit(
+                                    "udp_inbound_fast_fail_drop",
+                                    EventSource::Network,
+                                    serde_json::json!({
+                                        "from": from.to_string(),
+                                        "source": from.ip().to_string(),
+                                        "reason": "threshold_exceeded",
+                                        "threshold_per_sec": threshold_per_window,
+                                        "block_for_ms": block_for.as_millis(),
+                                    }),
+                                )
+                                .await;
+                            continue;
+                        }
+                    }
+                }
+
                 self.monitor
                     .emit(
                         "udp_receive",
@@ -495,6 +759,7 @@ impl DhtTransport {
         bootstrap_peers: Vec<String>,
         monitor: MonitorHandle,
     ) -> Result<Self> {
+        let abuse_config = AbusePreventionConfig::from_env();
         monitor
             .emit(
                 "dht_init",
@@ -601,12 +866,54 @@ impl DhtTransport {
                     let (udp_msg_tx, udp_msg_rx) = mpsc::channel::<Envelope>(64);
                     let monitor_for_fallback = monitor.clone();
                     let mut udp_fragments: HashMap<String, UdpFragmentState> = HashMap::new();
+                    let mut source_guard = UdpSourceFastFailGuard::from_config(abuse_config);
                     tokio::spawn(async move {
                         let mut buf = vec![0u8; 65536];
                         loop {
                             let res = rx_socket.recv_from(&mut buf).await;
                             match res {
-                                Ok((n, _)) => {
+                                Ok((n, from)) => {
+                                    if let Some(guard) = source_guard.as_mut() {
+                                        match guard.check(&from, Instant::now()) {
+                                            UdpSourceDecision::Allow => {}
+                                            UdpSourceDecision::DropBlocked { retry_after } => {
+                                                let _ = monitor_for_fallback
+                                                    .emit(
+                                                        "udp_inbound_fast_fail_drop",
+                                                        EventSource::Network,
+                                                        serde_json::json!({
+                                                            "from": from.to_string(),
+                                                            "source": from.ip().to_string(),
+                                                            "reason": "blocked",
+                                                            "retry_after_ms": retry_after.as_millis(),
+                                                            "from_dht": true,
+                                                        }),
+                                                    )
+                                                    .await;
+                                                continue;
+                                            }
+                                            UdpSourceDecision::DropThresholdExceeded {
+                                                threshold_per_window,
+                                                block_for,
+                                            } => {
+                                                let _ = monitor_for_fallback
+                                                    .emit(
+                                                        "udp_inbound_fast_fail_drop",
+                                                        EventSource::Network,
+                                                        serde_json::json!({
+                                                            "from": from.to_string(),
+                                                            "source": from.ip().to_string(),
+                                                            "reason": "threshold_exceeded",
+                                                            "threshold_per_sec": threshold_per_window,
+                                                            "block_for_ms": block_for.as_millis(),
+                                                            "from_dht": true,
+                                                        }),
+                                                    )
+                                                    .await;
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     if let Ok(env) = serde_json::from_slice::<Envelope>(&buf[..n]) {
                                         let _ = udp_msg_tx.send(env).await;
                                         continue;
@@ -854,11 +1161,32 @@ impl DhtTransport {
             fallback_udp,
             msg_rx,
             monitor,
+            outbound_rate_limiter: BroadcastRateLimiter::new(
+                abuse_config.dht_broadcasts_per_sec,
+                Duration::from_millis(BROADCAST_WINDOW_MILLIS),
+            ),
             _task: task,
         })
     }
 
     pub async fn broadcast(&self, msg: Envelope) -> Result<()> {
+        if let Some(limiter) = &self.outbound_rate_limiter {
+            if let BroadcastRateDecision::Block { retry_after } = limiter.check(Instant::now()) {
+                self.monitor
+                    .emit(
+                        "dht_rate_limited",
+                        EventSource::Network,
+                        serde_json::json!({
+                            "limit_per_sec": limiter.limit,
+                            "retry_after_ms": retry_after.as_millis(),
+                            "announce_addr": self.announce_addr,
+                        }),
+                    )
+                    .await;
+                return Err(anyhow!("dht broadcast rate limited"));
+            }
+        }
+
         let payload = serde_json::to_vec(&msg)?;
         let (reply_tx, reply_rx) = oneshot::channel();
         let msg_for_worker = msg.clone();
@@ -1060,4 +1388,92 @@ async fn send_udp_payload(socket: &UdpSocket, addr: &str, payload: &[u8]) -> Res
     }
 
     Ok((sent, bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BroadcastRateDecision, BroadcastRateLimiter, UdpSourceDecision, UdpSourceFastFailGuard,
+    };
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn broadcast_rate_limiter_blocks_when_limit_is_exceeded() {
+        let limiter =
+            BroadcastRateLimiter::new(2, Duration::from_millis(1_000)).expect("limiter enabled");
+        let now = Instant::now();
+
+        assert!(matches!(limiter.check(now), BroadcastRateDecision::Allow));
+        assert!(matches!(limiter.check(now), BroadcastRateDecision::Allow));
+        assert!(matches!(
+            limiter.check(now),
+            BroadcastRateDecision::Block { .. }
+        ));
+
+        assert!(matches!(
+            limiter.check(now + Duration::from_millis(1_001)),
+            BroadcastRateDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn source_fast_fail_blocks_and_recovers_after_block_window() {
+        let mut guard = UdpSourceFastFailGuard {
+            threshold_per_window: 3,
+            window: Duration::from_millis(1_000),
+            block_for: Duration::from_millis(500),
+            states: std::collections::HashMap::new(),
+        };
+        let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12_345);
+        let now = Instant::now();
+
+        assert!(matches!(
+            guard.check(&source, now),
+            UdpSourceDecision::Allow
+        ));
+        assert!(matches!(
+            guard.check(&source, now),
+            UdpSourceDecision::Allow
+        ));
+        assert!(matches!(
+            guard.check(&source, now),
+            UdpSourceDecision::Allow
+        ));
+        assert!(matches!(
+            guard.check(&source, now),
+            UdpSourceDecision::DropThresholdExceeded { .. }
+        ));
+
+        assert!(matches!(
+            guard.check(&source, now + Duration::from_millis(200)),
+            UdpSourceDecision::DropBlocked { .. }
+        ));
+        assert!(matches!(
+            guard.check(&source, now + Duration::from_millis(501)),
+            UdpSourceDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn source_fast_fail_applies_to_source_ip_not_port() {
+        let mut guard = UdpSourceFastFailGuard {
+            threshold_per_window: 1,
+            window: Duration::from_millis(1_000),
+            block_for: Duration::from_millis(500),
+            states: std::collections::HashMap::new(),
+        };
+        let source_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 20_000);
+        let source_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 20_001);
+        let now = Instant::now();
+
+        assert!(matches!(
+            guard.check(&source_a, now),
+            UdpSourceDecision::Allow
+        ));
+        assert!(matches!(
+            guard.check(&source_b, now),
+            UdpSourceDecision::DropThresholdExceeded { .. }
+        ));
+    }
 }
