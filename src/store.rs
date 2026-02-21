@@ -278,9 +278,11 @@ impl Store {
                                 primary_error: primary_err.to_string(),
                             });
                         let raw = serde_json::to_string_pretty(&self.state)?;
-                        self.write_snapshot(&state_path, &state_checksum_path, &raw)
-                            .await?;
+                        // Write backup first so that if the primary write fails the backup
+                        // is already consistent and can be used for the next recovery.
                         self.write_snapshot(&backup_state_path, &backup_checksum_path, &raw)
+                            .await?;
+                        self.write_snapshot(&state_path, &state_checksum_path, &raw)
                             .await?;
                     } else if backup_exists {
                         let backup_state = self
@@ -824,14 +826,16 @@ impl Store {
                 .map_err(|e| anyhow!("flush temp state file {}: {}", temp_path.display(), e))?;
         }
 
-        fs::rename(&temp_path, path).await.map_err(|e| {
-            anyhow!(
+        if let Err(e) = fs::rename(&temp_path, path).await {
+            // Best-effort cleanup: ignore removal errors to avoid masking the original rename error.
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(anyhow!(
                 "rename temp state file {} -> {}: {}",
                 temp_path.display(),
                 path.display(),
                 e
-            )
-        })?;
+            ));
+        }
 
         let persisted = fs::read_to_string(path).await?;
         let persisted_checksum = sha256_hex(persisted.as_bytes());
@@ -861,16 +865,16 @@ impl Store {
                 )
             })?;
         }
-        fs::rename(&temp_checksum_path, checksum_path)
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "rename temp checksum file {} -> {}: {}",
-                    temp_checksum_path.display(),
-                    checksum_path.display(),
-                    e
-                )
-            })?;
+        if let Err(e) = fs::rename(&temp_checksum_path, checksum_path).await {
+            // Best-effort cleanup: ignore removal errors to avoid masking the original rename error.
+            let _ = fs::remove_file(&temp_checksum_path).await;
+            return Err(anyhow!(
+                "rename temp checksum file {} -> {}: {}",
+                temp_checksum_path.display(),
+                checksum_path.display(),
+                e
+            ));
+        }
 
         Ok(())
     }
@@ -1315,6 +1319,8 @@ struct StateLockGuard {
 
 impl Drop for StateLockGuard {
     fn drop(&mut self) {
+        // Intentional synchronous best-effort cleanup: Drop cannot be async, so
+        // std::fs::remove_file is used directly. Failures are silently ignored by design.
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -1715,6 +1721,100 @@ mod tests {
         store.state.seen_messages.insert("stale".into(), 10);
         store.prune_seen_messages(30);
         assert!(!store.state.seen_messages.contains_key("stale"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_snapshot_cleans_temp_files_on_rename_failure() -> Result<()> {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("crabnet-temp-cleanup-{}", Uuid::new_v4()));
+
+        let mut store = Store::new(dir.clone());
+        store.load().await?;
+        store.add_seed(seed_with_id("seed-cleanup"));
+
+        // Create a read-only directory to force rename failure
+        let readonly_dir = dir.join("readonly");
+        fs::create_dir(&readonly_dir).await?;
+
+        // First save succeeds (creates the files)
+        let mut writable_store = Store::new(readonly_dir.clone());
+        writable_store.load().await?;
+        writable_store.add_seed(seed_with_id("seed-readonly"));
+        writable_store.save().await?;
+
+        // Make directory read-only (Unix-only, but test will skip gracefully on Windows)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&readonly_dir).await?.permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(&readonly_dir, perms).await?;
+
+            // Attempt to save again - should fail to rename due to read-only directory
+            let result = writable_store.save().await;
+
+            // Restore permissions for cleanup
+            let mut perms = fs::metadata(&readonly_dir).await?.permissions();
+            perms.set_readonly(false);
+            fs::set_permissions(&readonly_dir, perms).await?;
+
+            assert!(result.is_err(), "save should fail with read-only directory");
+
+            // Verify no orphaned .tmp files remain
+            let mut entries = fs::read_dir(&readonly_dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name();
+                assert!(
+                    !name.to_string_lossy().contains(".tmp"),
+                    "found orphaned tmp file: {:?}",
+                    name
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_write_order_preserves_backup_on_primary_failure() -> Result<()> {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("crabnet-recovery-order-{}", Uuid::new_v4()));
+
+        let mut writer = Store::new(dir.clone());
+        writer.load().await?;
+        writer.add_seed(seed_with_id("seed-initial"));
+        writer.save().await?;
+
+        // Verify initial backup exists
+        let initial_backup = fs::read_to_string(dir.join("state.json.bak")).await?;
+        assert!(initial_backup.contains("seed-initial"));
+
+        // Update state with new content
+        writer.add_seed(seed_with_id("seed-updated"));
+        let updated_state = serde_json::to_string_pretty(&writer.state)?;
+
+        // Trigger RepairedPrimaryWithoutChecksum path by writing valid JSON with wrong checksum
+        fs::write(dir.join("state.json"), updated_state).await?;
+        fs::write(dir.join("state.json.checksum"), "intentionally_wrong_checksum").await?;
+
+        // Load will trigger the repair path which writes backup FIRST, then primary
+        let loaded = writer.load().await?;
+        assert!(loaded, "load should trigger recovery path");
+
+        // Verify backup was updated with the new state
+        let updated_backup = fs::read_to_string(dir.join("state.json.bak")).await?;
+        assert!(
+            updated_backup.contains("seed-updated"),
+            "backup should be updated during recovery repair path"
+        );
+
+        // Verify the recovery signal is set correctly
+        assert_eq!(
+            writer.last_load_recovery().map(|s| s.as_str()),
+            Some("repaired_primary_without_checksum")
+        );
 
         Ok(())
     }

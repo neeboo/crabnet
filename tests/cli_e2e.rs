@@ -325,7 +325,7 @@ fn listener_cmd_network(
 }
 
 #[tokio::test]
-async fn cli_e2e_dual_node_sync_publish_bid() -> Result<()> {
+async fn cli_e2e_dual_node_udp_sync_publish_bid() -> Result<()> {
     let _serial = cli_e2e_serial_lock().lock().await;
     let bin = binary_path();
     let publisher_dir = make_tmp_dir("publisher");
