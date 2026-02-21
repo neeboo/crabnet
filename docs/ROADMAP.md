@@ -7,35 +7,9 @@
 
 ### P0 - State Safety and Execution Containment
 
-- [ ] Add state corruption recovery on load
-  - Task: persist checksum metadata for `state.json` writes.
-  - Task: add `.bak` fallback recovery path when primary state fails to parse.
-  - Task: emit explicit monitor event when fallback recovery is used.
-
-- [ ] Add multi-process write coordination for local files
-  - Task: add file locking around `state.json` writes.
-  - Task: prevent concurrent monitor writer corruption for `events.ndjson`.
+- [ ] Add monitor writer file lock
+  - Task: prevent concurrent `events.ndjson` writers.
   - Task: fail fast with explicit error when lock cannot be acquired.
-
-- [ ] Bound remote dedupe memory growth
-  - Task: replace unbounded `seen_messages` with bounded window/pruning.
-  - Task: persist pruning metadata compatible with existing state format.
-  - Task: expose effective dedupe/TTL config in startup logs.
-
-- [ ] Harden runner execution guardrails
-  - Task: add command allowlist + max command length + working directory restriction.
-  - Task: enforce hard process termination on timeout and persist termination reason.
-  - Task: cap stdout/stderr size and mark truncation in `TaskResult`.
-
-### P1 - Abuse Resistance and Auth
-
-- [ ] Protect monitor APIs
-  - Task: keep `/health` public.
-  - Task: add auth gate for `/api/events`, `/api/topology`, `/api/overview`.
-
-- [ ] Add network path abuse controls
-  - Task: rate-limit inbound/outbound UDP and DHT message paths.
-  - Task: add per-source drop thresholds and monitor counters.
 
 ### P2 - Deterministic State Convergence
 
@@ -83,6 +57,27 @@
 
 ## Completed in This Branch (Evidence)
 
+- [x] State corruption recovery (checksum + backup fallback) is implemented.
+  - Evidence: `src/store.rs` (`save`, `load`, `StoreLoadRecoverySignal`), `src/main.rs` emits `store_load_recovery_fallback`.
+
+- [x] `state.json` write lock coordination is implemented.
+  - Evidence: `src/store.rs` (`state.json.lock`, `acquire_state_lock`).
+
+- [x] Remote dedupe memory growth is bounded and TTL-configurable.
+  - Evidence: `src/store.rs` (`seen_messages` prune + `CRABNET_MESSAGE_TTL_SECONDS`), startup log in `src/main.rs`.
+
+- [x] Runner execution guardrails are implemented.
+  - Evidence: `src/runner.rs` (allowlist/workdir/timeout kill/output caps), `tests/runner_hardening.rs`.
+
+- [x] Monitor API auth gate is implemented with public `/health`.
+  - Evidence: `src/web.rs` (`ApiAuthConfig`, `api_auth_guard`), web tests.
+
+- [x] Network abuse controls are implemented.
+  - Evidence: `src/network.rs` (rate limiter + source fast-fail), network tests.
+
+- [x] Operator preflight/inspection commands are implemented.
+  - Evidence: `src/main.rs` (`--verify-config`, `--dump-topology`), `tests/cli_alignment.rs`.
+
 - [x] Hybrid post-quantum-capable payload protection is implemented.
   - Evidence: `src/store.rs` (`encrypt_for_peers`, `build_recipient_envelope`, `decrypt_payload`, `derive_session_key`).
 
@@ -99,7 +94,7 @@
   - Evidence: `src/network.rs` (`send_udp_payload`, `maybe_reassemble_fragment`, `fallback_send`).
 
 - [x] Two-node full flow stability is covered for both UDP and DHT.
-  - Evidence: `tests/cli_e2e.rs` (`cli_e2e_dual_node_sync_publish_bid_claim_run_settle`, `cli_e2e_dual_node_dht_sync_publish_bid_claim_run_settle`).
+  - Evidence: `tests/cli_e2e.rs` (`cli_e2e_dual_node_sync_publish_bid`, `cli_e2e_dual_node_dht_sync_publish_bid_claim_run_settle`).
 
 - [x] Atomic state write path with parseable concurrent-save regression coverage is implemented.
   - Evidence: `src/store.rs` (`save` temp-file + `sync_all` + rename), store tests `concurrent_saves_keep_state_json_parsable` and `save_overwrites_and_loads_without_corruption`.

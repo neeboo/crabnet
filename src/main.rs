@@ -240,10 +240,14 @@ async fn ensure_writable_file(path: &Path) -> Result<()> {
 
 async fn run_verify_config(cli: &Cli, monitor_path: &Path) -> Result<()> {
     let mut checks: Vec<(&str, Result<()>)> = Vec::new();
-    checks.push((
-        "announce_addr",
-        parse_udp_targets(&cli.announce_addr).map(|_| ()),
-    ));
+    let announce_required =
+        cli.network != NetworkBackend::Dht || !cli.announce_addr.trim().is_empty();
+    if announce_required {
+        checks.push((
+            "announce_addr",
+            parse_udp_targets(&cli.announce_addr).map(|_| ()),
+        ));
+    }
     checks.push(("listen_addr", parse_network_endpoint(&cli.listen_addr)));
     checks.push(("web_addr", parse_network_endpoint(&cli.web_addr)));
 
@@ -278,7 +282,11 @@ async fn run_verify_config(cli: &Cli, monitor_path: &Path) -> Result<()> {
         println!("listen_addr: {}", cli.listen_addr);
         println!(
             "announce_targets: {}",
-            parse_udp_targets(&cli.announce_addr)?.len()
+            if announce_required {
+                parse_udp_targets(&cli.announce_addr)?.len()
+            } else {
+                0
+            }
         );
         println!("data_dir: {}", cli.data_dir.display());
         println!("monitor_path: {}", monitor_path.display());
@@ -451,14 +459,15 @@ async fn main() -> Result<()> {
 
     if cli.verify_config {
         run_verify_config(&cli, &monitor_path).await?;
+        if !cli.dump_topology {
+            return Ok(());
+        }
     }
     if cli.dump_topology {
         run_dump_topology(&monitor_path).await?;
+        return Ok(());
     }
     if cli.command.is_none() {
-        if cli.verify_config || cli.dump_topology {
-            return Ok(());
-        }
         return Err(anyhow!(
             "missing command: use status|listen|seed, or --verify-config/--dump-topology"
         ));

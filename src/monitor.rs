@@ -33,7 +33,7 @@ pub struct MonitorEvent {
 #[derive(Clone)]
 pub struct MonitorHandle {
     node_id: String,
-    sender: Option<mpsc::Sender<MonitorEvent>>,
+    sender: Option<mpsc::SyncSender<MonitorEvent>>,
 }
 
 impl MonitorHandle {
@@ -49,7 +49,7 @@ impl MonitorHandle {
                 source,
                 payload: serde_json::to_value(payload).unwrap_or(Value::Null),
             };
-            let _ = tx.send(event);
+            let _ = tx.try_send(event);
         }
     }
 
@@ -62,7 +62,8 @@ impl MonitorHandle {
             };
         };
 
-        let (tx, rx) = mpsc::channel::<MonitorEvent>();
+        const MONITOR_CHANNEL_CAP: usize = 8192;
+        let (tx, rx) = mpsc::sync_channel::<MonitorEvent>(MONITOR_CHANNEL_CAP);
         std::thread::spawn(move || {
             let file = OpenOptions::new().create(true).append(true).open(path);
             let mut file = match file {

@@ -29,7 +29,7 @@ fn with_runner_env<F>(pairs: &[(&str, String)], f: F) -> Result<()>
 where
     F: FnOnce() -> Result<()>,
 {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
     let saved: Vec<(String, Option<String>)> = ENV_KEYS
         .iter()
         .map(|key| ((*key).to_string(), std::env::var(key).ok()))
@@ -75,6 +75,16 @@ fn rejects_command_outside_allowlist() -> Result<()> {
         assert_eq!(result.exit_code, -1);
         assert!(!result.timed_out);
         assert!(result.stderr.contains("not in allowlist"));
+        Ok(())
+    })
+}
+
+#[test]
+fn rejects_shell_chaining_even_if_allowlisted() -> Result<()> {
+    with_runner_env(&[(ENV_ALLOWED_COMMANDS, "echo".to_string())], || {
+        let result = run("echo ok; echo nope", 500)?;
+        assert_eq!(result.exit_code, -1);
+        assert!(result.stderr.contains("shell operators"));
         Ok(())
     })
 }
@@ -152,7 +162,7 @@ fn runs_inside_configured_workdir() -> Result<()> {
 #[test]
 fn timeout_kills_process_and_records_metadata() -> Result<()> {
     let (cmd, allow) = if cfg!(target_os = "windows") {
-        ("ping -n 6 127.0.0.1 > NUL", "ping")
+        ("ping -n 6 127.0.0.1", "ping")
     } else {
         ("sleep 5", "sleep")
     };
@@ -177,7 +187,7 @@ fn timeout_kills_process_and_records_metadata() -> Result<()> {
 fn truncates_stdout_and_stderr_by_configured_cap() -> Result<()> {
     with_runner_env(
         &[
-            (ENV_ALLOWED_COMMANDS, "printf".to_string()),
+            (ENV_ALLOWED_COMMANDS, "*".to_string()),
             (ENV_MAX_OUTPUT_BYTES, "64".to_string()),
         ],
         || {

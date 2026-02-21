@@ -90,6 +90,29 @@ async fn cli_verify_config_flag_succeeds_without_subcommand() -> Result<()> {
 }
 
 #[tokio::test]
+async fn cli_verify_config_allows_empty_announce_for_dht() -> Result<()> {
+    let bin = binary_path();
+    let data_dir = make_tmp_dir("verify-dht");
+
+    let (stdout, _) = run_cmd(
+        &bin,
+        &[
+            "--data-dir",
+            data_dir.to_string_lossy().as_ref(),
+            "--network",
+            "dht",
+            "--announce-addr",
+            "",
+            "--verify-config",
+        ],
+    )
+    .await?;
+
+    assert!(stdout.contains("verify-config: ok"), "stdout={stdout}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn cli_dump_topology_flag_reads_events_file() -> Result<()> {
     let bin = binary_path();
     let data_dir = make_tmp_dir("topology");

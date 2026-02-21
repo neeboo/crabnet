@@ -128,11 +128,11 @@ impl ApiAuthConfig {
             return false;
         };
 
-        bearer_token(headers).is_some_and(|token| token == expected)
+        bearer_token(headers).is_some_and(|token| constant_time_eq(token, expected))
             || headers
                 .get(X_API_TOKEN_HEADER)
                 .and_then(|value| value.to_str().ok())
-                .is_some_and(|token| token == expected)
+                .is_some_and(|token| constant_time_eq(token, expected))
     }
 }
 
@@ -142,6 +142,19 @@ fn parse_bool(value: &str) -> Option<bool> {
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    if a_bytes.len() != b_bytes.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a_bytes.len() {
+        diff |= a_bytes[i] ^ b_bytes[i];
+    }
+    diff == 0
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {

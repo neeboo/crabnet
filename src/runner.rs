@@ -123,15 +123,43 @@ fn normalized_token(token: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn is_command_allowed(command: &str, config: &RunnerConfig) -> bool {
+fn has_shell_control_chars(command: &str) -> bool {
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            ';' | '|' | '&' | '>' | '<' | '\n' | '\r' | '`' => return true,
+            '$' => {
+                if matches!(chars.peek(), Some('(')) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn command_rejection_reason(command: &str, config: &RunnerConfig) -> Option<String> {
     if config.allow_all {
-        return true;
+        return None;
+    }
+    if has_shell_control_chars(command) {
+        return Some("command contains disallowed shell operators".to_string());
     }
     let Some(token) = extract_command_token(command) else {
-        return false;
+        return Some("command missing executable token".to_string());
     };
     let token = normalized_token(token);
-    config.allowlist.iter().any(|allowed| allowed == &token)
+    if config.allowlist.iter().any(|allowed| allowed == &token) {
+        None
+    } else {
+        Some(format!(
+            "command `{}` is not in allowlist (workdir={}, root={})",
+            token,
+            config.workdir.display(),
+            config.allowed_root.display(),
+        ))
+    }
 }
 
 fn build_task_result(
@@ -234,16 +262,8 @@ pub async fn run_bash_task(command: &str, timeout_ms: u64) -> Result<TaskResult>
             ),
         ));
     }
-    if !is_command_allowed(command, &config) {
-        return Ok(rejected_result(
-            start,
-            &format!(
-                "command `{}` is not in allowlist (workdir={}, root={})",
-                extract_command_token(command).unwrap_or("<none>"),
-                config.workdir.display(),
-                config.allowed_root.display(),
-            ),
-        ));
+    if let Some(reason) = command_rejection_reason(command, &config) {
+        return Ok(rejected_result(start, &reason));
     }
 
     let (program, args) = command_builder(command);
