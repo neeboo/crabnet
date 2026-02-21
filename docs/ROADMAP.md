@@ -94,7 +94,7 @@
   - Evidence: `src/network.rs` (`send_udp_payload`, `maybe_reassemble_fragment`, `fallback_send`).
 
 - [x] Two-node full flow stability is covered for both UDP and DHT.
-  - Evidence: `tests/cli_e2e.rs` (`cli_e2e_dual_node_sync_publish_bid`, `cli_e2e_dual_node_dht_sync_publish_bid_claim_run_settle`).
+  - Evidence: `tests/cli_e2e.rs` (`cli_e2e_dual_node_udp_sync_publish_bid`, `cli_e2e_dual_node_dht_sync_publish_bid_claim_run_settle`).
 
 - [x] Atomic state write path with parseable concurrent-save regression coverage is implemented.
   - Evidence: `src/store.rs` (`save` temp-file + `sync_all` + rename), store tests `concurrent_saves_keep_state_json_parsable` and `save_overwrites_and_loads_without_corruption`.

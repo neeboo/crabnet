@@ -106,9 +106,17 @@ This reduces message loss risk when payload size exceeds single datagram limits.
 
 ## Current Hardening Gaps (still open)
 
-- No API auth gate on `/api/*` (except public `/health`).
-- No transport/source rate limiting on UDP or DHT paths.
-- `seen_messages` is unbounded and TTL value is compile-time constant.
-- Task runner does not enforce allowlist/workdir/output-size limits and timeout path does not force process kill metadata.
-- Multi-process `state.json` writers remain last-writer-wins; no file lock or checksum/backup recovery yet.
-- Monitor NDJSON is append-only without retention policy or centralized alerting.
+- Monitor NDJSON writer has no file lock to prevent concurrent writers (`events.ndjson`).
+- No retention policy on monitor NDJSON file; append-only without size/age limits.
+- No centralized alerting or external notification for hardening events.
+- No deterministic conflict resolution for concurrent seed updates across nodes.
+- No lifecycle expiry enforcement (background sweeper for timed-out `Open` seeds).
+
+## Implemented Hardening (completed in this branch)
+
+- API auth gate on `/api/*` with public `/health` (token via `Authorization: Bearer` or `X-Api-Token`).
+- Transport/source rate limiting on UDP and DHT paths (broadcast rate limiter + per-source fast-fail).
+- `seen_messages` is bounded and TTL value is runtime-configurable (`CRABNET_MESSAGE_TTL_SECONDS`).
+- Task runner enforces allowlist, workdir restriction, output-size caps, and force-kill on timeout.
+- `state.json` writes use file lock + checksum + backup recovery for safe multi-process operation.
+- Operator preflight and inspection commands: `--verify-config`, `--dump-topology`.

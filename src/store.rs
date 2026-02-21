@@ -278,9 +278,11 @@ impl Store {
                                 primary_error: primary_err.to_string(),
                             });
                         let raw = serde_json::to_string_pretty(&self.state)?;
-                        self.write_snapshot(&state_path, &state_checksum_path, &raw)
-                            .await?;
+                        // Write backup first so that if the primary write fails the backup
+                        // is already consistent and can be used for the next recovery.
                         self.write_snapshot(&backup_state_path, &backup_checksum_path, &raw)
+                            .await?;
+                        self.write_snapshot(&state_path, &state_checksum_path, &raw)
                             .await?;
                     } else if backup_exists {
                         let backup_state = self
@@ -824,14 +826,16 @@ impl Store {
                 .map_err(|e| anyhow!("flush temp state file {}: {}", temp_path.display(), e))?;
         }
 
-        fs::rename(&temp_path, path).await.map_err(|e| {
-            anyhow!(
+        if let Err(e) = fs::rename(&temp_path, path).await {
+            // Best-effort cleanup: ignore removal errors to avoid masking the original rename error.
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(anyhow!(
                 "rename temp state file {} -> {}: {}",
                 temp_path.display(),
                 path.display(),
                 e
-            )
-        })?;
+            ));
+        }
 
         let persisted = fs::read_to_string(path).await?;
         let persisted_checksum = sha256_hex(persisted.as_bytes());
@@ -1315,6 +1319,8 @@ struct StateLockGuard {
 
 impl Drop for StateLockGuard {
     fn drop(&mut self) {
+        // Intentional synchronous best-effort cleanup: Drop cannot be async, so
+        // std::fs::remove_file is used directly. Failures are silently ignored by design.
         let _ = std::fs::remove_file(&self.path);
     }
 }
