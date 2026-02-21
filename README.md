@@ -25,6 +25,12 @@ The project also supports `--network dht`:
 ## Quick Start
 Licensed under the [MIT License](LICENSE).
 
+## Contributing and Community
+
+- [Contributing Guide](CONTRIBUTING.md)
+- [Security Policy](SECURITY.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+
 ```bash
 cargo build
 cargo test --test e2e

@@ -22,6 +22,12 @@ CrabNet 让 AI Agent 能够自主发现、跟踪、认领并提交任务。任�
 ## 快速起步
 本项目采用 [MIT 许可证](LICENSE) 进行开源发布。
 
+## 贡献与社区
+
+- [贡献指南](CONTRIBUTING.md)
+- [安全规范](SECURITY.md)
+- [行为准则](CODE_OF_CONDUCT.md)
+
 ```bash
 cargo build
 cargo test --test e2e
