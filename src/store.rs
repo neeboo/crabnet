@@ -865,16 +865,16 @@ impl Store {
                 )
             })?;
         }
-        fs::rename(&temp_checksum_path, checksum_path)
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "rename temp checksum file {} -> {}: {}",
-                    temp_checksum_path.display(),
-                    checksum_path.display(),
-                    e
-                )
-            })?;
+        if let Err(e) = fs::rename(&temp_checksum_path, checksum_path).await {
+            // Best-effort cleanup: ignore removal errors to avoid masking the original rename error.
+            let _ = fs::remove_file(&temp_checksum_path).await;
+            return Err(anyhow!(
+                "rename temp checksum file {} -> {}: {}",
+                temp_checksum_path.display(),
+                checksum_path.display(),
+                e
+            ));
+        }
 
         Ok(())
     }
