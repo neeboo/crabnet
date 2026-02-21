@@ -4,8 +4,7 @@
 
 If you discover a security vulnerability, please report it privately before opening a public issue.
 
-- Email: security@your-domain.example (replace with your contact)
-- Subject: `CrabNet Security Report`
+- Contact the maintainers via project maintainers channel.
 - Include: steps to reproduce, impact, and proof-of-concept if available.
 
 We will acknowledge your report within 72 hours and provide a likely timeline after triage.
