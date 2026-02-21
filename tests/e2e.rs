@@ -19,6 +19,8 @@ async fn e2e_publish_bid_claim_run_settle_sync() -> Result<()> {
     let mut worker = Store::new(worker_dir.clone());
     publisher.load().await?;
     worker.load().await?;
+    worker.upsert_peer_identity(publisher.self_identity_info());
+    publisher.upsert_peer_identity(worker.self_identity_info());
 
     let now = model::current_ts();
     let seed = model::Seed {
@@ -43,16 +45,19 @@ async fn e2e_publish_bid_claim_run_settle_sync() -> Result<()> {
     };
     publisher.add_seed(seed.clone());
 
-    let seed_msg = model::Envelope::seed_created(publisher.node_id(), seed.clone());
+    let mut seed_msg = model::Envelope::seed_created(publisher.node_id(), seed.clone());
+    publisher.sign_envelope(&mut seed_msg)?;
     assert!(worker.apply_remote(seed_msg).await?);
     assert!(worker.seed(&seed.id).is_some());
 
     let bid = worker.add_bid(&seed.id, 1, "worker bid".into())?;
-    let bid_msg = model::Envelope::bid_submitted(worker.node_id(), bid.clone());
+    let mut bid_msg = model::Envelope::bid_submitted(worker.node_id(), bid.clone());
+    worker.sign_envelope(&mut bid_msg)?;
     assert!(publisher.apply_remote(bid_msg).await?);
 
     let claim = publisher.claim_seed(&seed.id, &bid.id)?;
-    let claim_msg = model::Envelope::claim_created(publisher.node_id(), claim.clone());
+    let mut claim_msg = model::Envelope::claim_created(publisher.node_id(), claim.clone());
+    publisher.sign_envelope(&mut claim_msg)?;
     assert!(worker.apply_remote(claim_msg).await?);
 
     let (command, timeout_ms) = {
@@ -62,11 +67,13 @@ async fn e2e_publish_bid_claim_run_settle_sync() -> Result<()> {
     publisher.mark_running(&seed.id)?;
     let result = run_bash_task(&command, timeout_ms).await?;
     let stored_result = publisher.add_result(&seed.id, result)?;
-    let result_msg = model::Envelope::task_result(publisher.node_id(), stored_result.clone());
+    let mut result_msg = model::Envelope::task_result(publisher.node_id(), stored_result.clone());
+    publisher.sign_envelope(&mut result_msg)?;
     assert!(worker.apply_remote(result_msg).await?);
 
     let settled = publisher.settle_seed(&seed.id, true, "accepted by publisher".into())?;
-    let settle_msg = model::Envelope::task_settle(publisher.node_id(), settled.clone());
+    let mut settle_msg = model::Envelope::task_settle(publisher.node_id(), settled.clone());
+    publisher.sign_envelope(&mut settle_msg)?;
     assert!(worker.apply_remote(settle_msg).await?);
 
     let w_seed = worker

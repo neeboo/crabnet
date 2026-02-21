@@ -1,11 +1,14 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::time::SystemTime;
+use tokio::fs;
 use tokio::process::Command;
 use tokio::time::sleep;
 
 use anyhow::{anyhow, Result};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crabnet_mvp::{model, store::Store};
@@ -167,6 +170,53 @@ async fn wait_for_status(dir: &PathBuf, seed_id: &str, expect: model::SeedStatus
     .await
 }
 
+async fn assert_no_not_addressed_noops(dir: &PathBuf) -> Result<()> {
+    let path = dir.join("events.ndjson");
+    let raw = fs::read_to_string(path).await?;
+    let mut not_addressed = HashSet::new();
+
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let event: Value = serde_json::from_str(line)?;
+        if event.get("kind").and_then(Value::as_str) != Some("store_sync_noop") {
+            continue;
+        }
+        let payload = event.get("payload");
+        if payload
+            .and_then(|payload| payload.get("reason"))
+            .and_then(Value::as_str)
+            == Some("not_addressed_to_this_node")
+        {
+            let node_id = event.get("node_id").and_then(Value::as_str).unwrap_or("");
+            let from = payload
+                .and_then(|payload| payload.get("from"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if node_id == from {
+                continue;
+            }
+            let message_id = payload
+                .and_then(|payload| payload.get("message_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            not_addressed.insert(format!("{node_id}->{from}:{message_id}"));
+        }
+    }
+
+    if !not_addressed.is_empty() {
+        anyhow::bail!(
+            "found not_addressed_to_this_node noop events in {}: {:?}",
+            dir.display(),
+            not_addressed
+        );
+    }
+
+    Ok(())
+}
+
 async fn wait_for_publisher_bid_sync(publisher_dir: &PathBuf, seed_id: &str) -> Result<()> {
     wait_for_condition(
         || async {
@@ -195,12 +245,20 @@ async fn wait_for_seed_sync(target_dir: &PathBuf, seed_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn listener_cmd(bin: &str, dir: &PathBuf, listen_addr: &str, web_addr: &str) -> Command {
+fn listener_cmd(
+    bin: &str,
+    dir: &PathBuf,
+    listen_addr: &str,
+    announce_addr: &str,
+    web_addr: &str,
+) -> Command {
     let mut cmd = Command::new(bin);
     cmd.arg("--data-dir")
         .arg(dir)
         .arg("--listen-addr")
         .arg(listen_addr)
+        .arg("--announce-addr")
+        .arg(announce_addr)
         .arg("--web-addr")
         .arg(web_addr);
     cmd.arg("listen");
@@ -238,10 +296,22 @@ async fn cli_e2e_dual_node_sync_publish_bid_claim_run_settle() -> Result<()> {
     let (publisher_listen, worker_listen) = unique_port_pair(12020);
     let both_announces = format!("{publisher_listen},{worker_listen}");
 
-    let mut publisher_listener =
-        listener_cmd(&bin, &publisher_dir, &publisher_listen, "127.0.0.1:3101").spawn()?;
-    let mut worker_listener =
-        listener_cmd(&bin, &worker_dir, &worker_listen, "127.0.0.1:3102").spawn()?;
+    let mut publisher_listener = listener_cmd(
+        &bin,
+        &publisher_dir,
+        &publisher_listen,
+        &both_announces,
+        "127.0.0.1:3101",
+    )
+    .spawn()?;
+    let mut worker_listener = listener_cmd(
+        &bin,
+        &worker_dir,
+        &worker_listen,
+        &both_announces,
+        "127.0.0.1:3102",
+    )
+    .spawn()?;
     sleep(Duration::from_millis(900)).await;
 
     let result: Result<()> = async {
@@ -352,6 +422,8 @@ async fn cli_e2e_dual_node_sync_publish_bid_claim_run_settle() -> Result<()> {
 
         wait_for_status(&publisher_dir, &seed_id, model::SeedStatus::Accepted).await?;
         wait_for_status(&worker_dir, &seed_id, model::SeedStatus::Accepted).await?;
+        assert_no_not_addressed_noops(&publisher_dir).await?;
+        assert_no_not_addressed_noops(&worker_dir).await?;
 
         let mut publisher_store = Store::new(publisher_dir.clone());
         let mut worker_store = Store::new(worker_dir.clone());
@@ -532,6 +604,8 @@ async fn cli_e2e_dual_node_dht_sync_publish_bid_claim_run_settle() -> Result<()>
 
         wait_for_status(&publisher_dir, &seed_id, model::SeedStatus::Accepted).await?;
         wait_for_status(&worker_dir, &seed_id, model::SeedStatus::Accepted).await?;
+        assert_no_not_addressed_noops(&publisher_dir).await?;
+        assert_no_not_addressed_noops(&worker_dir).await?;
 
         let mut publisher_store = Store::new(publisher_dir.clone());
         let mut worker_store = Store::new(worker_dir.clone());

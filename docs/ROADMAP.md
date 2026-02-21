@@ -22,10 +22,16 @@
 
 ## Milestone 1 (Security and Identity)
 
-- [ ] Add sender identity and signature verification
-  - Task: define signature algorithm and key id format for `Envelope`.
-  - Task: persist and validate signer identity for claims/results against seed creator/workers.
-  - Task: drop unauthenticated messages in network layer and emit explicit monitor events.
+- [x] Add hybrid post-quantum-capable message transport for broadcast payloads.
+  - Task: add `Envelope.crypto` recipient entries and hybrid key agreement (`x25519` ephemeral + `Kyber768` KEM) during broadcast.
+  - Task: derive session keys via HKDF and encrypt payloads with `ChaCha20-Poly1305`.
+  - Task: support local fallback for peers without identity/keys and for legacy plaintext messages.
+  - Task: onboard peers through `NodeHello` containing static `x25519` and `Kyber768` public keys.
+
+- [x] Add sender identity and signature verification
+  - Task: define and store dual signature algorithm metadata on `Envelope`.
+  - Task: add Ed25519 + Dilithium2 signatures for outbound envelopes.
+  - Task: verify sender identity for all remote messages and reject unauthenticated senders.
 
 - [ ] Add API auth model for monitor endpoints
   - Task: add optional token or header-based gate for `/api/*` endpoints.

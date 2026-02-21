@@ -150,15 +150,18 @@ async fn main() -> Result<()> {
             serde_json::json!({ "network": format!("{:?}", cli.network) }),
         )
         .await;
-    let mesh = MeshClient::new(
-        store.node_id().to_string(),
-        cli.announce_addr.clone(),
-        cli.listen_addr.clone(),
-        cli.bootstrap_peers.clone(),
-        cli.network,
-        monitor.clone(),
-    )
-    .await?;
+    let mesh = {
+        let backend = cli.network;
+        MeshClient::new(
+            store.node_id().to_string(),
+            cli.announce_addr.clone(),
+            cli.listen_addr.clone(),
+            cli.bootstrap_peers.clone(),
+            backend,
+            monitor.clone(),
+        )
+        .await?
+    };
 
     match cli.command {
         Commands::Status => {
@@ -179,6 +182,34 @@ async fn main() -> Result<()> {
                 cli.network,
                 listener.bind_addr()
             );
+            let mut hello = Envelope::node_hello(store.node_id(), store.self_identity_info());
+            if let Err(err) = store.sign_envelope(&mut hello) {
+                monitor
+                    .emit(
+                        "node_hello_send_failed",
+                        EventSource::Node,
+                        serde_json::json!({ "reason": err.to_string() }),
+                    )
+                    .await;
+            } else {
+                for attempt in 1..=3 {
+                    if let Err(err) = mesh.broadcast(hello.clone()).await {
+                        monitor
+                            .emit(
+                                "node_hello_send_failed",
+                                EventSource::Node,
+                                serde_json::json!({
+                                    "reason": err.to_string(),
+                                    "attempt": attempt,
+                                }),
+                            )
+                            .await;
+                    }
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
             let web_state = web::WebState {
                 monitor_path: monitor_path.clone(),
             };
@@ -190,22 +221,77 @@ async fn main() -> Result<()> {
             });
             loop {
                 if let Some(msg) = listener.next_message().await? {
-                    if store.apply_remote(msg.clone()).await? {
-                        store.save().await?;
-                        let _ = monitor
-                            .emit(
-                                "store_sync",
-                                EventSource::Node,
-                                serde_json::json!({
-                                    "kind": format!("{:?}", msg.meta.kind),
-                                    "seed_id": msg.meta.id,
-                                    "from": msg.meta.from,
-                                }),
-                            )
-                            .await;
-                        println!("> synced:{}", store.last_event_desc());
-                        if cli.network == NetworkBackend::Dht {
-                            mesh.broadcast(msg).await?;
+                    let msg_kind = format!("{:?}", msg.meta.kind);
+                    let msg_id = msg.meta.id.clone();
+                    let msg_from = msg.meta.from.clone();
+                    let _ = monitor
+                        .emit(
+                            "listener_message_received",
+                            EventSource::Node,
+                            serde_json::json!({
+                                "kind": msg_kind,
+                                "message_id": msg_id,
+                                "from": msg_from,
+                            }),
+                        )
+                        .await;
+                    match store.apply_remote_with_reason(msg.clone()).await {
+                        Ok((changed, reason)) => {
+                            if changed {
+                                store.save().await?;
+                                let _ = monitor
+                                    .emit(
+                                        "store_sync",
+                                        EventSource::Node,
+                                        serde_json::json!({
+                                            "kind": msg_kind,
+                                            "message_id": msg_id,
+                                            "from": msg_from,
+                                        }),
+                                    )
+                                    .await;
+                                println!("> synced:{}", store.last_event_desc());
+                                if cli.network == NetworkBackend::Dht && msg.crypto.is_empty() {
+                                    mesh.broadcast(msg).await?;
+                                }
+                            }
+                            if !changed {
+                                if !msg_from.eq(store.node_id())
+                                    || !matches!(
+                                        reason,
+                                        Some(store::ApplyRemoteNoopReason::NotAddressedToThisNode)
+                                    )
+                                {
+                                    let _ = monitor
+                                        .emit(
+                                            "store_sync_noop",
+                                            EventSource::Node,
+                                            serde_json::json!({
+                                                "kind": msg_kind,
+                                                "message_id": msg_id,
+                                                "from": msg_from,
+                                                "reason": reason
+                                                    .map(|reason| reason.as_str())
+                                                    .unwrap_or("unknown"),
+                                            }),
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            let _ = monitor
+                                .emit(
+                                    "store_sync_rejected",
+                                    EventSource::Node,
+                                    serde_json::json!({
+                                        "kind": format!("{:?}", msg.meta.kind),
+                                        "seed_id": msg.meta.id,
+                                        "from": msg.meta.from,
+                                        "error": err.to_string(),
+                                    }),
+                                )
+                                .await;
                         }
                     }
                 }
@@ -258,8 +344,12 @@ async fn main() -> Result<()> {
                         }),
                     )
                     .await;
-                let msg = Envelope::seed_created(store.node_id(), seed.clone());
+                let mut msg = Envelope::seed_created(store.node_id(), seed.clone());
                 if announce {
+                    if cli.network != NetworkBackend::Dht {
+                        msg = store.encrypt_for_peers(msg)?;
+                    }
+                    store.sign_envelope(&mut msg)?;
                     mesh.broadcast(msg).await?;
                 }
                 println!("seed published {}", seed.id);
@@ -292,7 +382,11 @@ async fn main() -> Result<()> {
                     .await;
                 println!("bid submitted {}", bid.id);
                 if announce {
-                    let msg = Envelope::bid_submitted(store.node_id(), bid);
+                    let mut msg = Envelope::bid_submitted(store.node_id(), bid);
+                    if cli.network != NetworkBackend::Dht {
+                        msg = store.encrypt_for_peers(msg)?;
+                    }
+                    store.sign_envelope(&mut msg)?;
                     mesh.broadcast(msg).await?;
                 }
             }
@@ -314,7 +408,11 @@ async fn main() -> Result<()> {
                     .await;
                 println!("claim created {}", claim.id);
                 if announce {
-                    let msg = Envelope::claim_created(store.node_id(), claim);
+                    let mut msg = Envelope::claim_created(store.node_id(), claim);
+                    if cli.network != NetworkBackend::Dht {
+                        msg = store.encrypt_for_peers(msg)?;
+                    }
+                    store.sign_envelope(&mut msg)?;
                     mesh.broadcast(msg).await?;
                 }
             }
@@ -341,7 +439,11 @@ async fn main() -> Result<()> {
                     )
                     .await;
                 println!("task result {} hash={}", stored.id, stored.output_hash);
-                let msg = Envelope::task_result(store.node_id(), result);
+                let mut msg = Envelope::task_result(store.node_id(), result);
+                if cli.network != NetworkBackend::Dht {
+                    msg = store.encrypt_for_peers(msg)?;
+                }
+                store.sign_envelope(&mut msg)?;
                 mesh.broadcast(msg).await?;
             }
             SeedCommand::Settle {
@@ -364,7 +466,11 @@ async fn main() -> Result<()> {
                     .await;
                 println!("seed {} settled as {:?}", settled.id, settled.status);
                 if announce {
-                    let msg = Envelope::task_settle(store.node_id(), settled.clone());
+                    let mut msg = Envelope::task_settle(store.node_id(), settled.clone());
+                    if cli.network != NetworkBackend::Dht {
+                        msg = store.encrypt_for_peers(msg)?;
+                    }
+                    store.sign_envelope(&mut msg)?;
                     mesh.broadcast(msg).await?;
                 }
             }

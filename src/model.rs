@@ -91,7 +91,14 @@ pub struct EnvelopeMeta {
     pub kind: MessageKind,
     pub ts: u64,
     pub nonce: u64,
+    #[serde(default)]
     pub signature: String,
+    #[serde(default)]
+    pub ed25519_signature: String,
+    #[serde(default)]
+    pub dilithium_signature: String,
+    #[serde(default)]
+    pub sender_identity: Option<NodeIdentityInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,12 +108,36 @@ pub enum MessageKind {
     ClaimCreated,
     TaskResult,
     TaskSettle,
+    NodeHello,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvelopeCrypto {
+    pub to: String,
+    pub x25519_ephemeral_pk: String,
+    pub kyber_ct: String,
+    pub nonce: String,
+    pub ciphertext: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeIdentityInfo {
+    pub node_id: String,
+    pub alias: String,
+    pub x25519_public: String,
+    pub kyber_public: String,
+    #[serde(default)]
+    pub ed25519_public: String,
+    #[serde(default)]
+    pub dilithium_public: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
     pub meta: EnvelopeMeta,
     pub payload: Value,
+    #[serde(default)]
+    pub crypto: Vec<EnvelopeCrypto>,
 }
 
 impl Envelope {
@@ -150,6 +181,14 @@ impl Envelope {
         )
     }
 
+    pub fn node_hello(from: &str, identity: NodeIdentityInfo) -> Self {
+        Self::build(
+            from,
+            MessageKind::NodeHello,
+            serde_json::json!({ "identity": identity }),
+        )
+    }
+
     fn build(from: &str, kind: MessageKind, payload: Value) -> Self {
         let ts = current_ts();
         Self {
@@ -160,8 +199,12 @@ impl Envelope {
                 ts,
                 nonce: ts,
                 signature: String::new(),
+                ed25519_signature: String::new(),
+                dilithium_signature: String::new(),
+                sender_identity: None,
             },
             payload,
+            crypto: Vec::new(),
         }
     }
 }

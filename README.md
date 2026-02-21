@@ -18,6 +18,26 @@ The project also supports `--network dht`:
 - `udp`: default transport, local UDP broadcast path
 - `dht`: libp2p gossipsub + mDNS path with UDP fallback where needed
 
+## Security and Post-Quantum Transport
+
+CrabNet now uses hybrid message protection for remote synchronization:
+
+1. Peer onboarding via signed `NodeHello` identity exchange.
+2. Per-message hybrid session key derivation:
+   - X25519 ephemeral Diffie-Hellman
+   - Kyber768 KEM shared secret
+   - HKDF-SHA256 key derivation
+3. Payload encryption with `ChaCha20-Poly1305` (`Envelope.crypto` recipient entries).
+4. Envelope authenticity with dual signatures:
+   - Ed25519
+   - Dilithium2
+
+Design notes:
+
+- This is message-layer security, not a VPN tunnel.
+- Signature verification happens before state apply.
+- Unknown peers are rejected unless identity is established.
+
 ## Quick Start
 Licensed under the [MIT License](LICENSE).
 
@@ -144,5 +164,5 @@ API endpoints:
 
 ## Notes
 
-- No signatures/replay prevention/encrypted settlement are implemented in this version.
-- Priority is correctness of the closed loop; scaling and trust features are planned in next steps.
+- Message authentication and hybrid post-quantum-capable encryption are enabled for sync envelopes.
+- Remaining hardening work (rate limiting, replay window tuning, API auth) is tracked in `docs/ROADMAP.md`.

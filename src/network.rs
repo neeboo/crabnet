@@ -15,12 +15,16 @@ use libp2p::{
     tcp::tokio::Transport as TokioTcpTransport,
     yamux, Multiaddr, PeerId, Transport,
 };
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum NetworkBackend {
@@ -52,6 +56,22 @@ struct UdpTransport {
     socket: UdpSocket,
     announce_addr: String,
     monitor: MonitorHandle,
+    fragments: HashMap<String, UdpFragmentState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UdpFragment {
+    envelope_id: String,
+    total: u16,
+    index: u16,
+    payload: String,
+}
+
+#[derive(Debug)]
+struct UdpFragmentState {
+    total: usize,
+    received: Vec<Option<Vec<u8>>>,
+    last_seen: Instant,
 }
 
 enum DhtCommand {
@@ -77,6 +97,11 @@ struct DhtBehaviour {
 }
 
 const DHT_TOPIC: &str = "crabnet-mvp-v1";
+const UDP_FRAGMENT_SIZE: usize = 512;
+const UDP_MAX_DATAGRAM: usize = 1200;
+const UDP_FRAGMENT_TTL_SECONDS: u64 = 30;
+const UDP_FRAGMENT_SEND_ATTEMPTS: usize = 3;
+const UDP_FRAGMENT_RESEND_DELAY_MS: u64 = 10;
 
 impl MeshClient {
     pub async fn new(
@@ -292,6 +317,7 @@ impl UdpTransport {
             socket,
             announce_addr,
             monitor,
+            fragments: HashMap::new(),
         })
     }
 
@@ -320,6 +346,7 @@ impl UdpTransport {
             socket,
             announce_addr: String::new(),
             monitor,
+            fragments: HashMap::new(),
         })
     }
 
@@ -332,7 +359,7 @@ impl UdpTransport {
             if addr.is_empty() {
                 continue;
             }
-            let n = self.socket.send_to(data.as_bytes(), addr).await?;
+            let n = self.send_payload(addr, data.as_bytes()).await?;
             if n > 0 {
                 sent = true;
                 sent_count = sent_count.saturating_add(1);
@@ -354,22 +381,82 @@ impl UdpTransport {
         Ok(())
     }
 
+    async fn send_payload(&self, target: &str, payload: &[u8]) -> Result<usize> {
+        self.send_payload_to_target(target, payload).await
+    }
+
+    async fn send_payload_to_target(&self, addr: &str, payload: &[u8]) -> Result<usize> {
+        let (_, bytes) = send_udp_payload(&self.socket, addr, payload).await?;
+        Ok(bytes)
+    }
+
     pub async fn next_message(&mut self) -> Result<Option<Envelope>> {
         let mut buf = vec![0u8; 65536];
-        if let Ok((n, from)) = self.socket.recv_from(&mut buf).await {
-            self.monitor
-                .emit(
-                    "udp_receive",
-                    EventSource::Network,
-                    serde_json::json!({
-                        "from": from.to_string(),
-                        "bytes": n,
-                    }),
-                )
-                .await;
-            return Ok(serde_json::from_slice::<Envelope>(&buf[..n]).ok());
+        loop {
+            if let Ok((n, from)) = self.socket.recv_from(&mut buf).await {
+                self.monitor
+                    .emit(
+                        "udp_receive",
+                        EventSource::Network,
+                        serde_json::json!({
+                            "from": from.to_string(),
+                            "bytes": n,
+                        }),
+                    )
+                    .await;
+
+                if let Ok(msg) = serde_json::from_slice::<Envelope>(&buf[..n]) {
+                    return Ok(Some(msg));
+                }
+
+                if let Ok(mut fragment) = serde_json::from_slice::<UdpFragment>(&buf[..n]) {
+                    match self.handle_fragment(&mut fragment).await {
+                        Ok(Some(msg)) => {
+                            return Ok(Some(msg));
+                        }
+                        Ok(None) => continue,
+                        Err(err) => {
+                            let _ = self
+                                .monitor
+                                .emit(
+                                    "udp_fragment_failed",
+                                    EventSource::Network,
+                                    serde_json::json!({
+                                        "from": from.to_string(),
+                                        "envelope_id": fragment.envelope_id,
+                                        "error": err.to_string(),
+                                    }),
+                                )
+                                .await;
+                        }
+                    }
+                    continue;
+                }
+
+                let _ = self
+                    .monitor
+                    .emit(
+                        "udp_receive_unparseable",
+                        EventSource::Network,
+                        serde_json::json!({
+                            "from": from.to_string(),
+                            "bytes": n,
+                        }),
+                    )
+                    .await;
+            }
+            return Ok(None);
         }
-        Ok(None)
+    }
+
+    async fn handle_fragment(&mut self, fragment: &mut UdpFragment) -> Result<Option<Envelope>> {
+        maybe_reassemble_fragment(
+            &mut self.fragments,
+            fragment,
+            UDP_FRAGMENT_TTL_SECONDS,
+            &self.monitor,
+        )
+        .await
     }
 }
 
@@ -512,6 +599,8 @@ impl DhtTransport {
                     }
 
                     let (udp_msg_tx, udp_msg_rx) = mpsc::channel::<Envelope>(64);
+                    let monitor_for_fallback = monitor.clone();
+                    let mut udp_fragments: HashMap<String, UdpFragmentState> = HashMap::new();
                     tokio::spawn(async move {
                         let mut buf = vec![0u8; 65536];
                         loop {
@@ -520,6 +609,45 @@ impl DhtTransport {
                                 Ok((n, _)) => {
                                     if let Ok(env) = serde_json::from_slice::<Envelope>(&buf[..n]) {
                                         let _ = udp_msg_tx.send(env).await;
+                                        continue;
+                                    }
+                                    if let Ok(mut fragment) =
+                                        serde_json::from_slice::<UdpFragment>(&buf[..n])
+                                    {
+                                        match maybe_reassemble_fragment(
+                                            &mut udp_fragments,
+                                            &mut fragment,
+                                            UDP_FRAGMENT_TTL_SECONDS,
+                                            &monitor_for_fallback,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Some(env)) => {
+                                                let _ = udp_msg_tx.send(env).await;
+                                            }
+                                            Ok(None) => {}
+                                            Err(err) => {
+                                                let _ = monitor_for_fallback
+                                                    .emit(
+                                                        "udp_fragment_failed",
+                                                        EventSource::Network,
+                                                        serde_json::json!({
+                                                            "from_dht": true,
+                                                            "envelope_id": fragment.envelope_id,
+                                                            "error": err.to_string(),
+                                                        }),
+                                                    )
+                                                    .await;
+                                            }
+                                        }
+                                    } else {
+                                        let _ = monitor_for_fallback
+                                            .emit(
+                                                "udp_receive_unparseable",
+                                                EventSource::Network,
+                                                serde_json::json!({ "from_dht": true, "bytes": n }),
+                                            )
+                                            .await;
                                     }
                                 }
                                 Err(_) => break,
@@ -781,8 +909,8 @@ impl DhtTransport {
         let mut sent = false;
         for addr in parse_udp_targets(&self.announce_addr) {
             let addr_for_send = addr.clone();
-            if let Ok(n) = udp.send_to(payload, addr_for_send).await {
-                if n > 0 {
+            if let Ok((is_sent, bytes)) = send_udp_payload(udp, &addr_for_send, payload).await {
+                if is_sent && bytes > 0 {
                     sent = true;
                     let addr = addr.clone();
                     let _ = self
@@ -792,7 +920,7 @@ impl DhtTransport {
                             EventSource::Network,
                             serde_json::json!({
                                 "target": addr,
-                                "bytes": n,
+                                "bytes": bytes,
                                 "announce_addr": self.announce_addr,
                             }),
                         )
@@ -811,4 +939,125 @@ impl DhtTransport {
 
 fn listen_from_str(s: &str) -> String {
     s.to_string()
+}
+
+async fn maybe_reassemble_fragment(
+    fragments: &mut HashMap<String, UdpFragmentState>,
+    fragment: &mut UdpFragment,
+    ttl_seconds: u64,
+    monitor: &MonitorHandle,
+) -> Result<Option<Envelope>> {
+    let now = Instant::now();
+    let mut dropped = 0usize;
+    fragments.retain(|_, state| {
+        let keep = now.duration_since(state.last_seen).as_secs() <= ttl_seconds;
+        if !keep {
+            dropped += 1;
+        }
+        keep
+    });
+    if dropped > 0 {
+        let _ = monitor
+            .emit(
+                "udp_fragment_dropped",
+                EventSource::Network,
+                serde_json::json!({ "count": dropped }),
+            )
+            .await;
+    }
+
+    let total = usize::from(fragment.total);
+    if total == 0 {
+        return Ok(None);
+    }
+
+    let index = usize::from(fragment.index);
+    if index >= total {
+        return Ok(None);
+    }
+
+    let chunk = hex::decode(&fragment.payload)?;
+    let state = fragments
+        .entry(fragment.envelope_id.clone())
+        .or_insert_with(|| UdpFragmentState {
+            total,
+            received: vec![None; total],
+            last_seen: Instant::now(),
+        });
+
+    if state.total != total {
+        state.total = total;
+        state.received.resize_with(total, || None);
+    }
+    state.last_seen = Instant::now();
+    if state.received[index].is_none() {
+        state.received[index] = Some(chunk);
+    }
+
+    if state.received.iter().all(std::option::Option::is_some) {
+        let mut payload = Vec::new();
+        for part in state.received.iter() {
+            if let Some(chunk) = part {
+                payload.extend_from_slice(chunk);
+            } else {
+                return Ok(None);
+            }
+        }
+        fragments.remove(&fragment.envelope_id);
+        let _ = monitor
+            .emit(
+                "udp_fragment_reassembled",
+                EventSource::Network,
+                serde_json::json!({
+                    "envelope_id": fragment.envelope_id,
+                    "total": total,
+                    "from": fragment.envelope_id,
+                }),
+            )
+            .await;
+        let envelope = serde_json::from_slice(&payload)?;
+        Ok(Some(envelope))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn send_udp_payload(socket: &UdpSocket, addr: &str, payload: &[u8]) -> Result<(bool, usize)> {
+    if payload.len() <= UDP_MAX_DATAGRAM {
+        let n = socket.send_to(payload, addr).await?;
+        return Ok((n > 0, n));
+    }
+
+    let envelope_id = Uuid::new_v4().to_string();
+    let total = u16::try_from((payload.len() + UDP_FRAGMENT_SIZE - 1) / UDP_FRAGMENT_SIZE)
+        .map_err(|_| anyhow!("udp payload too large for fragmentation"))?;
+
+    let mut sent = false;
+    let mut bytes = 0usize;
+    let fragments: Vec<Vec<u8>> = payload
+        .chunks(UDP_FRAGMENT_SIZE)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    for attempt in 1..=UDP_FRAGMENT_SEND_ATTEMPTS {
+        for (index, chunk) in fragments.iter().enumerate() {
+            let index = u16::try_from(index).map_err(|_| anyhow!("udp fragment index overflow"))?;
+            let fragment = UdpFragment {
+                envelope_id: envelope_id.clone(),
+                total,
+                index,
+                payload: hex::encode(chunk),
+            };
+            let encoded = serde_json::to_vec(&fragment)?;
+            let n = socket.send_to(&encoded, addr).await?;
+            if n > 0 {
+                sent = true;
+                bytes = bytes.saturating_add(n);
+            }
+        }
+        if attempt < UDP_FRAGMENT_SEND_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(UDP_FRAGMENT_RESEND_DELAY_MS)).await;
+        }
+    }
+
+    Ok((sent, bytes))
 }
