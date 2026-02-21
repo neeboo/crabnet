@@ -112,7 +112,7 @@ This reduces message loss risk when payload size exceeds single datagram limits.
 - No deterministic conflict resolution for concurrent seed updates across nodes.
 - No lifecycle expiry enforcement (background sweeper for timed-out `Open` seeds).
 
-## Implemented Hardening (completed in this branch)
+## Implemented Hardening (completed)
 
 - API auth gate on `/api/*` with public `/health` (token via `Authorization: Bearer` or `X-Api-Token`).
 - Transport/source rate limiting on UDP and DHT paths (broadcast rate limiter + per-source fast-fail).
