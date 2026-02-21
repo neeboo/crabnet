@@ -22,16 +22,46 @@ use pqcrypto_traits::sign::{
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use tokio::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::time::{Duration as StdDuration, Instant, SystemTime};
+use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
+use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 use x25519_dalek_ng::{EphemeralSecret, PublicKey, StaticSecret};
 
+const DEFAULT_SEEN_MESSAGES_CAPACITY: usize = 10_000;
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);
+const LOCK_STALE_AFTER: StdDuration = StdDuration::from_secs(30);
+
 fn default_empty_string() -> String {
     String::new()
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SeenMessagesCompat {
+    New(HashMap<String, u64>),
+    Legacy(HashSet<String>),
+}
+
+fn deserialize_seen_messages<'de, D>(
+    deserializer: D,
+) -> std::result::Result<HashMap<String, u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<SeenMessagesCompat>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(SeenMessagesCompat::New(entries)) => entries,
+        Some(SeenMessagesCompat::Legacy(entries)) => {
+            entries.into_iter().map(|id| (id, 0)).collect()
+        }
+        None => HashMap::new(),
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,8 +93,8 @@ pub struct State {
     pub bids: HashMap<String, Bid>,
     pub claims: HashMap<String, Claim>,
     pub results: HashMap<String, TaskResult>,
-    #[serde(default)]
-    pub seen_messages: HashSet<String>,
+    #[serde(default, deserialize_with = "deserialize_seen_messages")]
+    pub seen_messages: HashMap<String, u64>,
     #[serde(default)]
     pub peers: HashMap<String, NodeIdentityInfo>,
 }
@@ -73,9 +103,28 @@ pub struct Store {
     data_dir: PathBuf,
     pub state: State,
     last_event: String,
+    message_ttl_seconds: u64,
+    seen_message_ttl_seconds: u64,
+    seen_messages_capacity: usize,
+    last_load_recovery: Option<StoreLoadRecoverySignal>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreLoadRecoverySignal {
+    RecoveredFromBackup { primary_error: String },
+    RepairedPrimaryWithoutChecksum { primary_error: String },
+}
+
+impl StoreLoadRecoverySignal {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RecoveredFromBackup { .. } => "recovered_from_backup",
+            Self::RepairedPrimaryWithoutChecksum { .. } => "repaired_primary_without_checksum",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyRemoteNoopReason {
     Expired,
     SeenMessage,
@@ -88,6 +137,12 @@ pub enum ApplyRemoteNoopReason {
     DuplicateResult,
     DuplicateSettle,
     DuplicateHello,
+    MalformedNodeHello,
+    MalformedSeed,
+    MalformedBid,
+    MalformedClaim,
+    MalformedResult,
+    MalformedSettle,
 }
 
 impl ApplyRemoteNoopReason {
@@ -104,6 +159,12 @@ impl ApplyRemoteNoopReason {
             Self::DuplicateResult => "duplicate_result",
             Self::DuplicateSettle => "duplicate_settle",
             Self::DuplicateHello => "duplicate_hello",
+            Self::MalformedNodeHello => "malformed_node_hello",
+            Self::MalformedSeed => "malformed_seed",
+            Self::MalformedBid => "malformed_bid",
+            Self::MalformedClaim => "malformed_claim",
+            Self::MalformedResult => "malformed_result",
+            Self::MalformedSettle => "malformed_settle",
         }
     }
 }
@@ -112,24 +173,53 @@ impl Store {
     pub fn new(data_dir: PathBuf) -> Self {
         let alias = std::env::var("USER").unwrap_or_else(|_| "node".into());
         let identity = generate_identity(alias);
+        let message_ttl_seconds =
+            read_env_u64("CRABNET_MESSAGE_TTL_SECONDS", MSG_TTL_SECONDS).max(1);
+        let seen_message_ttl_seconds =
+            read_env_u64("CRABNET_SEEN_MESSAGES_TTL_SECONDS", message_ttl_seconds).max(1);
+        let seen_messages_capacity = read_env_usize(
+            "CRABNET_SEEN_MESSAGES_CAPACITY",
+            DEFAULT_SEEN_MESSAGES_CAPACITY,
+        )
+        .max(1);
         let state = State {
             identity,
             seeds: HashMap::new(),
             bids: HashMap::new(),
             claims: HashMap::new(),
             results: HashMap::new(),
-            seen_messages: HashSet::new(),
+            seen_messages: HashMap::new(),
             peers: HashMap::new(),
         };
         Self {
             data_dir,
             state,
             last_event: "init".into(),
+            message_ttl_seconds,
+            seen_message_ttl_seconds,
+            seen_messages_capacity,
+            last_load_recovery: None,
         }
     }
 
     fn state_path(&self) -> PathBuf {
         self.data_dir.join("state.json")
+    }
+
+    fn state_checksum_path(&self) -> PathBuf {
+        self.data_dir.join("state.json.sha256")
+    }
+
+    fn backup_state_path(&self) -> PathBuf {
+        self.data_dir.join("state.json.bak")
+    }
+
+    fn backup_checksum_path(&self) -> PathBuf {
+        self.data_dir.join("state.json.bak.sha256")
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        self.data_dir.join("state.json.lock")
     }
 
     pub fn node_id(&self) -> &str {
@@ -161,59 +251,142 @@ impl Store {
 
     pub async fn load(&mut self) -> Result<bool> {
         fs::create_dir_all(&self.data_dir).await?;
-        let path = self.state_path();
-        let has_state = fs::try_exists(&path).await?;
-        if has_state {
-            let raw = fs::read_to_string(&path).await?;
-            self.state = serde_json::from_str(&raw)?;
-            if self.state.identity.x25519_public.is_empty()
-                || self.state.identity.x25519_private.is_empty()
-                || self.state.identity.kyber_public.is_empty()
-                || self.state.identity.kyber_private.is_empty()
-                || self.state.identity.ed25519_public.is_empty()
-                || self.state.identity.ed25519_private.is_empty()
-                || self.state.identity.dilithium_public.is_empty()
-                || self.state.identity.dilithium_private.is_empty()
+        self.last_load_recovery = None;
+        let _lock = self.acquire_state_lock().await?;
+        let state_path = self.state_path();
+        let state_checksum_path = self.state_checksum_path();
+        let backup_state_path = self.backup_state_path();
+        let backup_checksum_path = self.backup_checksum_path();
+        let primary_exists = fs::try_exists(&state_path).await?;
+        let backup_exists = fs::try_exists(&backup_state_path).await?;
+
+        if primary_exists {
+            match self
+                .read_state_with_checksum(&state_path, &state_checksum_path)
+                .await
             {
-                let alias = self.state.identity.alias.clone();
-                self.state.identity = generate_identity(alias);
+                Ok(state) => {
+                    self.state = state;
+                }
+                Err(primary_err) => {
+                    // If checksum validation fails but primary JSON is still parseable, prefer
+                    // repairing primary over rolling back to an older backup snapshot.
+                    if let Ok(primary_state) = self.read_state_without_checksum(&state_path).await {
+                        self.state = primary_state;
+                        self.last_load_recovery =
+                            Some(StoreLoadRecoverySignal::RepairedPrimaryWithoutChecksum {
+                                primary_error: primary_err.to_string(),
+                            });
+                        let raw = serde_json::to_string_pretty(&self.state)?;
+                        self.write_snapshot(&state_path, &state_checksum_path, &raw)
+                            .await?;
+                        self.write_snapshot(&backup_state_path, &backup_checksum_path, &raw)
+                            .await?;
+                    } else if backup_exists {
+                        let backup_state = self
+                            .read_state_with_checksum(&backup_state_path, &backup_checksum_path)
+                            .await
+                            .map_err(|backup_err| {
+                                anyhow!(
+                                    "state load failed: primary={} backup={}",
+                                    primary_err,
+                                    backup_err
+                                )
+                            })?;
+                        self.state = backup_state;
+                        self.last_load_recovery =
+                            Some(StoreLoadRecoverySignal::RecoveredFromBackup {
+                                primary_error: primary_err.to_string(),
+                            });
+                        self.write_snapshot(
+                            &state_path,
+                            &state_checksum_path,
+                            &serde_json::to_string_pretty(&self.state)?,
+                        )
+                        .await?;
+                    } else {
+                        return Err(anyhow!("state load failed: {}", primary_err));
+                    }
+                }
             }
+        } else if backup_exists {
+            let backup_state = self
+                .read_state_with_checksum(&backup_state_path, &backup_checksum_path)
+                .await?;
+            self.state = backup_state;
+            self.last_load_recovery = Some(StoreLoadRecoverySignal::RecoveredFromBackup {
+                primary_error: "state.json missing".into(),
+            });
+            self.write_snapshot(
+                &state_path,
+                &state_checksum_path,
+                &serde_json::to_string_pretty(&self.state)?,
+            )
+            .await?;
         }
-        if self.state.seen_messages.is_empty() {
-            self.state.seen_messages = HashSet::new();
+        if self.state.identity.x25519_public.is_empty()
+            || self.state.identity.x25519_private.is_empty()
+            || self.state.identity.kyber_public.is_empty()
+            || self.state.identity.kyber_private.is_empty()
+            || self.state.identity.ed25519_public.is_empty()
+            || self.state.identity.ed25519_private.is_empty()
+            || self.state.identity.dilithium_public.is_empty()
+            || self.state.identity.dilithium_private.is_empty()
+        {
+            let alias = self.state.identity.alias.clone();
+            self.state.identity = generate_identity(alias);
         }
         if self.state.peers.is_empty() {
             self.state.peers = HashMap::new();
         }
-        Ok(has_state)
+        let now = current_ts();
+        for seen_at in self.state.seen_messages.values_mut() {
+            if *seen_at == 0 {
+                *seen_at = now;
+            }
+        }
+        self.prune_seen_messages(now);
+        Ok(primary_exists || backup_exists)
     }
 
     pub async fn save(&self) -> Result<()> {
         fs::create_dir_all(&self.data_dir).await?;
-        let temp_path = self
-            .state_path()
-            .with_file_name(format!(".state.json.{}.tmp", Uuid::new_v4()));
+        let _lock = self.acquire_state_lock().await?;
         let raw = serde_json::to_string_pretty(&self.state)?;
-        {
-            let mut file = File::create(&temp_path)
-                .await
-                .map_err(|e| anyhow!("create temp state file {}: {}", temp_path.display(), e))?;
-            file.write_all(raw.as_bytes()).await?;
-            file.sync_all()
-                .await
-                .map_err(|e| anyhow!("flush temp state file {}: {}", temp_path.display(), e))?;
-        }
-        fs::rename(&temp_path, self.state_path())
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "rename temp state file {} -> {}: {}",
-                    temp_path.display(),
-                    self.state_path().display(),
-                    e
-                )
-            })?;
+        self.write_snapshot(&self.state_path(), &self.state_checksum_path(), &raw)
+            .await?;
+        self.write_snapshot(
+            &self.backup_state_path(),
+            &self.backup_checksum_path(),
+            &raw,
+        )
+        .await?;
         Ok(())
+    }
+
+    pub fn message_ttl_seconds(&self) -> u64 {
+        self.message_ttl_seconds
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_message_ttl_seconds(&mut self, ttl_seconds: u64) {
+        self.message_ttl_seconds = ttl_seconds.max(1);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_seen_message_policy(&mut self, ttl_seconds: u64, capacity: usize) {
+        self.seen_message_ttl_seconds = ttl_seconds.max(1);
+        self.seen_messages_capacity = capacity.max(1);
+        self.prune_seen_messages(current_ts());
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn last_load_recovery(&self) -> Option<&StoreLoadRecoverySignal> {
+        self.last_load_recovery.as_ref()
+    }
+
+    pub fn take_load_recovery(&mut self) -> Option<StoreLoadRecoverySignal> {
+        self.last_load_recovery.take()
     }
 
     pub fn add_seed(&mut self, seed: Seed) {
@@ -349,7 +522,7 @@ impl Store {
         message: Envelope,
     ) -> Result<(bool, Option<ApplyRemoteNoopReason>)> {
         let now = current_ts();
-        if now.saturating_sub(message.meta.ts) > MSG_TTL_SECONDS {
+        if now.saturating_sub(message.meta.ts) > self.message_ttl_seconds {
             return Ok((false, Some(ApplyRemoteNoopReason::Expired)));
         }
         let msg_id = message.meta.id.clone();
@@ -374,18 +547,21 @@ impl Store {
             }
         };
 
-        if !self.state.seen_messages.insert(message.meta.id.clone()) {
+        if !self.record_seen_message(message.meta.id.clone(), now) {
             return Ok((false, Some(ApplyRemoteNoopReason::SeenMessage)));
         }
 
         let value = message.payload;
         let changed = match message.meta.kind {
             MessageKind::NodeHello => {
-                let identity = value
-                    .get("identity")
-                    .cloned()
-                    .ok_or_else(|| anyhow!("malformed node hello"))?;
-                let identity: crate::model::NodeIdentityInfo = serde_json::from_value(identity)?;
+                let identity = match payload_value::<crate::model::NodeIdentityInfo>(
+                    &value,
+                    "identity",
+                    ApplyRemoteNoopReason::MalformedNodeHello,
+                ) {
+                    Ok(identity) => identity,
+                    Err(reason) => return Ok((false, Some(reason))),
+                };
                 if self.upsert_peer_identity(identity) {
                     true
                 } else {
@@ -393,11 +569,14 @@ impl Store {
                 }
             }
             MessageKind::SeedCreated => {
-                let seed = value
-                    .get("seed")
-                    .cloned()
-                    .ok_or_else(|| anyhow!("malformed seed message"))?;
-                let seed: Seed = serde_json::from_value(seed)?;
+                let seed = match payload_value::<Seed>(
+                    &value,
+                    "seed",
+                    ApplyRemoteNoopReason::MalformedSeed,
+                ) {
+                    Ok(seed) => seed,
+                    Err(reason) => return Ok((false, Some(reason))),
+                };
                 if !self.state.seeds.contains_key(&seed.id) {
                     self.state.seeds.insert(seed.id.clone(), seed);
                     true
@@ -406,11 +585,14 @@ impl Store {
                 }
             }
             MessageKind::BidSubmitted => {
-                let bid = value
-                    .get("bid")
-                    .cloned()
-                    .ok_or_else(|| anyhow!("malformed bid message"))?;
-                let bid: Bid = serde_json::from_value(bid)?;
+                let bid = match payload_value::<Bid>(
+                    &value,
+                    "bid",
+                    ApplyRemoteNoopReason::MalformedBid,
+                ) {
+                    Ok(bid) => bid,
+                    Err(reason) => return Ok((false, Some(reason))),
+                };
                 if !self.state.bids.contains_key(&bid.id) {
                     self.state.bids.insert(bid.id.clone(), bid);
                     true
@@ -419,11 +601,14 @@ impl Store {
                 }
             }
             MessageKind::ClaimCreated => {
-                let claim = value
-                    .get("claim")
-                    .cloned()
-                    .ok_or_else(|| anyhow!("malformed claim message"))?;
-                let claim: Claim = serde_json::from_value(claim)?;
+                let claim = match payload_value::<Claim>(
+                    &value,
+                    "claim",
+                    ApplyRemoteNoopReason::MalformedClaim,
+                ) {
+                    Ok(claim) => claim,
+                    Err(reason) => return Ok((false, Some(reason))),
+                };
                 if !self.state.claims.contains_key(&claim.id) {
                     self.state.claims.insert(claim.id.clone(), claim.clone());
                     if let Some(seed) = self.state.seeds.get_mut(&claim.seed_id) {
@@ -437,11 +622,14 @@ impl Store {
                 }
             }
             MessageKind::TaskResult => {
-                let result = value
-                    .get("result")
-                    .cloned()
-                    .ok_or_else(|| anyhow!("malformed result message"))?;
-                let result: TaskResult = serde_json::from_value(result)?;
+                let result = match payload_value::<TaskResult>(
+                    &value,
+                    "result",
+                    ApplyRemoteNoopReason::MalformedResult,
+                ) {
+                    Ok(result) => result,
+                    Err(reason) => return Ok((false, Some(reason))),
+                };
                 if !self.state.results.contains_key(&result.id) {
                     self.state.results.insert(result.id.clone(), result.clone());
                     if let Some(seed) = self.state.seeds.get_mut(&result.seed_id) {
@@ -454,11 +642,14 @@ impl Store {
                 }
             }
             MessageKind::TaskSettle => {
-                let seed = value
-                    .get("seed")
-                    .cloned()
-                    .ok_or_else(|| anyhow!("malformed settle message"))?;
-                let remote: Seed = serde_json::from_value(seed)?;
+                let remote = match payload_value::<Seed>(
+                    &value,
+                    "seed",
+                    ApplyRemoteNoopReason::MalformedSettle,
+                ) {
+                    Ok(seed) => seed,
+                    Err(reason) => return Ok((false, Some(reason))),
+                };
                 if let Some(local) = self.state.seeds.get_mut(&remote.id) {
                     let before_status = local.status.clone();
                     let before_claim_id = local.claim_id.clone();
@@ -575,6 +766,178 @@ impl Store {
 
     pub fn last_event_desc(&self) -> &str {
         &self.last_event
+    }
+
+    async fn acquire_state_lock(&self) -> Result<StateLockGuard> {
+        let path = self.lock_path();
+        let start = Instant::now();
+        loop {
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .await
+            {
+                Ok(mut file) => {
+                    let note = format!("pid={} ts={}\n", std::process::id(), current_ts());
+                    file.write_all(note.as_bytes()).await?;
+                    file.sync_all().await?;
+                    return Ok(StateLockGuard { path });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lock_is_stale(&path).await? {
+                        let _ = fs::remove_file(&path).await;
+                        continue;
+                    }
+                    if start.elapsed() > LOCK_WAIT_TIMEOUT {
+                        return Err(anyhow!(
+                            "timed out waiting for store lock {}",
+                            path.display()
+                        ));
+                    }
+                    sleep(LOCK_RETRY_DELAY).await;
+                }
+                Err(err) => {
+                    return Err(anyhow!("create lock file {}: {}", path.display(), err));
+                }
+            }
+        }
+    }
+
+    async fn write_snapshot(&self, path: &Path, checksum_path: &Path, raw: &str) -> Result<()> {
+        let temp_path =
+            path.with_file_name(format!(".{}.{}.tmp", display_name(path), Uuid::new_v4()));
+        let temp_checksum_path = checksum_path.with_file_name(format!(
+            ".{}.{}.tmp",
+            display_name(checksum_path),
+            Uuid::new_v4()
+        ));
+        let checksum = sha256_hex(raw.as_bytes());
+
+        {
+            let mut file = File::create(&temp_path)
+                .await
+                .map_err(|e| anyhow!("create temp state file {}: {}", temp_path.display(), e))?;
+            file.write_all(raw.as_bytes()).await?;
+            file.sync_all()
+                .await
+                .map_err(|e| anyhow!("flush temp state file {}: {}", temp_path.display(), e))?;
+        }
+
+        fs::rename(&temp_path, path).await.map_err(|e| {
+            anyhow!(
+                "rename temp state file {} -> {}: {}",
+                temp_path.display(),
+                path.display(),
+                e
+            )
+        })?;
+
+        let persisted = fs::read_to_string(path).await?;
+        let persisted_checksum = sha256_hex(persisted.as_bytes());
+        if persisted_checksum != checksum {
+            return Err(anyhow!(
+                "state durability check failed for {}: expected {} got {}",
+                path.display(),
+                checksum,
+                persisted_checksum
+            ));
+        }
+
+        {
+            let mut file = File::create(&temp_checksum_path).await.map_err(|e| {
+                anyhow!(
+                    "create temp checksum file {}: {}",
+                    temp_checksum_path.display(),
+                    e
+                )
+            })?;
+            file.write_all(format!("{checksum}\n").as_bytes()).await?;
+            file.sync_all().await.map_err(|e| {
+                anyhow!(
+                    "flush temp checksum file {}: {}",
+                    temp_checksum_path.display(),
+                    e
+                )
+            })?;
+        }
+        fs::rename(&temp_checksum_path, checksum_path)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "rename temp checksum file {} -> {}: {}",
+                    temp_checksum_path.display(),
+                    checksum_path.display(),
+                    e
+                )
+            })?;
+
+        Ok(())
+    }
+
+    async fn read_state_with_checksum(&self, path: &Path, checksum_path: &Path) -> Result<State> {
+        let raw = fs::read_to_string(path)
+            .await
+            .map_err(|err| anyhow!("read {}: {}", path.display(), err))?;
+        if fs::try_exists(checksum_path).await? {
+            let expected = fs::read_to_string(checksum_path)
+                .await
+                .map_err(|err| anyhow!("read {}: {}", checksum_path.display(), err))?;
+            let expected = expected.trim();
+            if expected.is_empty() {
+                return Err(anyhow!("empty checksum file {}", checksum_path.display()));
+            }
+            let actual = sha256_hex(raw.as_bytes());
+            if actual != expected {
+                return Err(anyhow!(
+                    "checksum mismatch for {}: expected {} got {}",
+                    path.display(),
+                    expected,
+                    actual
+                ));
+            }
+        }
+        serde_json::from_str(&raw).map_err(|err| anyhow!("parse {}: {}", path.display(), err))
+    }
+
+    async fn read_state_without_checksum(&self, path: &Path) -> Result<State> {
+        let raw = fs::read_to_string(path)
+            .await
+            .map_err(|err| anyhow!("read {}: {}", path.display(), err))?;
+        serde_json::from_str(&raw).map_err(|err| anyhow!("parse {}: {}", path.display(), err))
+    }
+
+    fn record_seen_message(&mut self, message_id: String, now: u64) -> bool {
+        self.prune_seen_messages(now);
+        if self.state.seen_messages.contains_key(&message_id) {
+            return false;
+        }
+        self.state.seen_messages.insert(message_id, now);
+        self.prune_seen_messages(now);
+        true
+    }
+
+    fn prune_seen_messages(&mut self, now: u64) {
+        let cutoff = now.saturating_sub(self.seen_message_ttl_seconds);
+        self.state
+            .seen_messages
+            .retain(|_, seen_at| *seen_at >= cutoff);
+
+        if self.state.seen_messages.len() <= self.seen_messages_capacity {
+            return;
+        }
+
+        let mut oldest: Vec<(String, u64)> = self
+            .state
+            .seen_messages
+            .iter()
+            .map(|(id, seen_at)| (id.clone(), *seen_at))
+            .collect();
+        oldest.sort_by_key(|(_, seen_at)| *seen_at);
+        let overflow = oldest.len().saturating_sub(self.seen_messages_capacity);
+        for (id, _) in oldest.into_iter().take(overflow) {
+            self.state.seen_messages.remove(&id);
+        }
     }
 
     fn sign_ed25519(&self, data: &[u8]) -> Result<String> {
@@ -946,12 +1309,105 @@ fn generate_identity(alias: String) -> NodeIdentity {
     }
 }
 
+struct StateLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for StateLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+async fn lock_is_stale(path: &Path) -> Result<bool> {
+    let metadata = match fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(anyhow!("stat lock file {}: {}", path.display(), err)),
+    };
+    let modified = metadata
+        .modified()
+        .map_err(|err| anyhow!("read lock mtime {}: {}", path.display(), err))?;
+    let age = match SystemTime::now().duration_since(modified) {
+        Ok(age) => age,
+        Err(_) => return Ok(false),
+    };
+    Ok(age > LOCK_STALE_AFTER)
+}
+
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "state".into())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_encode(&hasher.finalize())
+}
+
+fn payload_value<T: serde::de::DeserializeOwned>(
+    payload: &serde_json::Value,
+    key: &str,
+    malformed_reason: ApplyRemoteNoopReason,
+) -> std::result::Result<T, ApplyRemoteNoopReason> {
+    let value = payload.get(key).cloned().ok_or(malformed_reason)?;
+    serde_json::from_value(value).map_err(|_| malformed_reason)
+}
+
+fn read_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn read_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{current_ts, Envelope, Seed, SeedStatus, Store};
+    use super::{current_ts, ApplyRemoteNoopReason, Envelope, Seed, SeedStatus, Store};
     use anyhow::Result;
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    use tokio::fs;
     use tokio::time::{sleep, Duration};
     use uuid::Uuid;
+
+    fn seed_with_id(id: &str) -> Seed {
+        Seed {
+            id: id.into(),
+            title: id.into(),
+            description: "".into(),
+            command: "echo ok".into(),
+            timeout_ms: 1000,
+            bid_deadline_ts: current_ts() + 60,
+            exec_deadline_ms: 3000,
+            min_price: 1,
+            max_bids: 2,
+            reward: 0,
+            rules: "".into(),
+            status: SeedStatus::Open,
+            created_by: "tester".into(),
+            created_at: current_ts(),
+            claimed_by: None,
+            claimed_at: None,
+            claim_id: None,
+            result_id: None,
+        }
+    }
+
+    fn checksum_hex(raw: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(raw.as_bytes());
+        hex::encode(hasher.finalize())
+    }
 
     #[tokio::test]
     async fn concurrent_saves_keep_state_json_parsable() -> Result<()> {
@@ -1011,13 +1467,14 @@ mod tests {
         // Give FS a tiny settling window on some platforms.
         sleep(Duration::from_millis(50)).await;
 
-        let mut viewer = Store::new(dir);
+        let mut viewer = Store::new(dir.clone());
         viewer.load().await?;
         assert!(viewer.state.seeds.len() <= 1);
         assert!(
             viewer.state.seeds.get("left-seed").is_some()
                 || viewer.state.seeds.get("right-seed").is_some()
         );
+        assert!(!fs::try_exists(dir.join("state.json.lock")).await?);
         Ok(())
     }
 
@@ -1028,7 +1485,10 @@ mod tests {
 
         let mut store = Store::new(dir.clone());
         store.load().await?;
-        store.state.seen_messages.insert("msg-1".into());
+        store
+            .state
+            .seen_messages
+            .insert("msg-1".into(), current_ts());
         store.add_seed(Seed {
             id: "seed-a".into(),
             title: "seed-a".into(),
@@ -1135,6 +1595,126 @@ mod tests {
         hello.meta.signature.clear();
 
         assert!(receiver.verify_envelope(&hello).is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn save_persists_checksum_and_backup_files() -> Result<()> {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("crabnet-store-checksum-{}", Uuid::new_v4()));
+
+        let mut store = Store::new(dir.clone());
+        store.load().await?;
+        store.add_seed(seed_with_id("seed-checksum"));
+        store.save().await?;
+
+        let state_path = dir.join("state.json");
+        let checksum_path = dir.join("state.json.sha256");
+        let backup_path = dir.join("state.json.bak");
+        let backup_checksum_path = dir.join("state.json.bak.sha256");
+        assert!(fs::try_exists(&state_path).await?);
+        assert!(fs::try_exists(&checksum_path).await?);
+        assert!(fs::try_exists(&backup_path).await?);
+        assert!(fs::try_exists(&backup_checksum_path).await?);
+
+        let state_raw = fs::read_to_string(&state_path).await?;
+        let checksum = fs::read_to_string(&checksum_path).await?;
+        assert_eq!(checksum.trim(), checksum_hex(&state_raw));
+
+        let backup_raw = fs::read_to_string(&backup_path).await?;
+        let backup_checksum = fs::read_to_string(&backup_checksum_path).await?;
+        assert_eq!(backup_checksum.trim(), checksum_hex(&backup_raw));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_recovers_from_backup_when_primary_corrupt() -> Result<()> {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("crabnet-store-recovery-{}", Uuid::new_v4()));
+
+        let mut writer = Store::new(dir.clone());
+        writer.load().await?;
+        writer.add_seed(seed_with_id("seed-recover"));
+        writer.save().await?;
+
+        fs::write(dir.join("state.json"), "{\"broken\":true}").await?;
+
+        let mut reader = Store::new(dir);
+        let loaded = reader.load().await?;
+        assert!(loaded);
+        assert_eq!(
+            reader.last_load_recovery().map(|signal| signal.as_str()),
+            Some("recovered_from_backup")
+        );
+        assert!(reader.state.seeds.contains_key("seed-recover"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_remote_uses_configurable_message_ttl() -> Result<()> {
+        let mut receiver_dir = std::env::temp_dir();
+        receiver_dir.push(format!("crabnet-ttl-receiver-{}", Uuid::new_v4()));
+        let mut sender_dir = std::env::temp_dir();
+        sender_dir.push(format!("crabnet-ttl-sender-{}", Uuid::new_v4()));
+
+        let mut receiver = Store::new(receiver_dir);
+        let mut sender = Store::new(sender_dir);
+        receiver.load().await?;
+        sender.load().await?;
+        receiver.set_message_ttl_seconds(1);
+
+        let mut msg = Envelope::seed_created(sender.node_id(), seed_with_id("seed-ttl"));
+        sender.sign_envelope(&mut msg)?;
+        msg.meta.ts = current_ts().saturating_sub(5);
+        let (changed, noop) = receiver.apply_remote_with_reason(msg).await?;
+        assert!(!changed);
+        assert_eq!(noop, Some(ApplyRemoteNoopReason::Expired));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_remote_reports_explicit_malformed_reason() -> Result<()> {
+        let mut receiver_dir = std::env::temp_dir();
+        receiver_dir.push(format!("crabnet-malformed-receiver-{}", Uuid::new_v4()));
+        let mut sender_dir = std::env::temp_dir();
+        sender_dir.push(format!("crabnet-malformed-sender-{}", Uuid::new_v4()));
+
+        let mut receiver = Store::new(receiver_dir);
+        let mut sender = Store::new(sender_dir);
+        receiver.load().await?;
+        sender.load().await?;
+
+        let mut msg = Envelope::seed_created(sender.node_id(), seed_with_id("seed-malformed"));
+        msg.payload = json!({"not_seed": true});
+        sender.sign_envelope(&mut msg)?;
+        let (changed, noop) = receiver.apply_remote_with_reason(msg).await?;
+        assert!(!changed);
+        assert_eq!(noop, Some(ApplyRemoteNoopReason::MalformedSeed));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seen_messages_prunes_by_ttl_and_capacity() -> Result<()> {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("crabnet-seen-window-{}", Uuid::new_v4()));
+        let mut store = Store::new(dir);
+        store.load().await?;
+        store.set_seen_message_policy(10, 3);
+
+        assert!(store.record_seen_message("msg-a".into(), 100));
+        assert!(store.record_seen_message("msg-b".into(), 101));
+        assert!(store.record_seen_message("msg-c".into(), 102));
+        assert!(store.record_seen_message("msg-d".into(), 103));
+        assert_eq!(store.state.seen_messages.len(), 3);
+        assert!(!store.state.seen_messages.contains_key("msg-a"));
+        assert!(store.state.seen_messages.contains_key("msg-d"));
+
+        store.state.seen_messages.insert("stale".into(), 10);
+        store.prune_seen_messages(30);
+        assert!(!store.state.seen_messages.contains_key("stale"));
 
         Ok(())
     }

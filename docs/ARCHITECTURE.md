@@ -4,131 +4,111 @@
 
 ## Design Goals
 
-The backend is currently bounded as a single binary node that:
+Crabnet currently runs as a single binary node that:
 
-- receives and applies local and remote events
-- persists local state and task results
-- broadcasts events over a pluggable transport (`udp` or `dht`)
-- exposes a read-only monitoring HTTP API
+- executes local CLI actions for `publish -> bid -> claim -> run -> settle`
+- syncs state across peers over `udp` or `dht`
+- stores local state and monitor events on disk
+- exposes read-only monitor APIs for operators
 
-The immediate goal is to harden runtime reliability and consistency first, then grow security and scalability.
+Hardening focus in this branch is concrete runtime safety for remote sync: authenticated messages, encrypted payload fan-out, deterministic reject/noop paths, and stronger transport fallback behavior.
 
-## Component Boundaries
+## Runtime Components
 
 - `main` (`src/main.rs`)
   - CLI entrypoint and lifecycle control
-  - initializes `Store`, `Monitor`, and `MeshClient`
-  - routes command behavior (`listen`, `status`, `seed` commands)
+  - initializes `Store`, `MeshClient`, and `MonitorHandle`
+  - `listen` mode starts message loop + web monitor server
+  - sends signed `NodeHello` (3 attempts) on listener startup
 
 - `store` (`src/store.rs`)
-  - persistent domain state for seeds, bids, claims, results, and node identity
-  - provides domain operations: publish, bid, claim, run, settle
-  - applies remote messages with idempotent semantics
-  - maintains a peer identity table with `x25519` and `Kyber768` public keys for encrypted fan-out
-  - builds recipient-specific encrypted envelopes for payload distribution
-
-- `model` (`src/model.rs`)
-  - domain objects: `Seed`, `Bid`, `Claim`, `TaskResult`
-  - envelope types (`Envelope`, `MessageKind`) used for network propagation
-  - adds `crypto` metadata to `Envelope` and `NodeHello` message kind for identity exchange
+  - local persistence (`state.json`) and domain state transitions
+  - remote apply pipeline with explicit noop reasons (`ApplyRemoteNoopReason`)
+  - peer identity table + signature verification policy
+  - per-recipient payload encryption/decryption helpers
 
 - `network` (`src/network.rs`)
-  - unified transport abstraction through `MeshClient`
-  - `NetworkBackend::Udp`: UDP unicast/broadcast
-  - `NetworkBackend::Dht`: libp2p gossipsub + mDNS with UDP fallback
+  - `udp` transport for direct broadcast/unicast
+  - `dht` transport (libp2p gossipsub + mDNS) with UDP fallback
+  - UDP payload fragmentation/reassembly for large envelopes
 
 - `runner` (`src/runner.rs`)
-  - local task runner using shell invocation (`bash -lc` on Unix, `cmd /C` on Windows)
-  - records result, duration, exit state, and output hash
+  - shell task execution (`bash -lc` / `cmd /C`)
+  - timeout-wrapped process execution + output hashing
 
 - `monitor` (`src/monitor.rs`)
-  - centralized event generation
-  - async NDJSON event persistence to `events.ndjson`
+  - unbounded async event channel
+  - append-only NDJSON sink (`events.ndjson`)
 
 - `web` (`src/web.rs`)
-  - Axum API endpoints: `/health`, `/api/events`, `/api/topology`, `/api/overview`
-  - static file serving and fallback frontend behavior
+  - API routes: `/health`, `/api/events`, `/api/topology`, `/api/overview`
+  - serves static monitor UI when frontend dist is available
 
-## Critical Flows
+## Hardened Remote Apply Flow (implemented)
 
-- Publish seed
-  1. CLI creates `Seed`
-  2. store writes local state
-  3. monitor event is emitted
-  4. optional broadcast with `Envelope::seed_created`
+Remote processing in `Store::apply_remote_with_reason` follows this order:
 
-- Bid / claim
-  1. local validations (status, bid window, minimum price, max bid limit)
-  2. bid/claim is persisted and event is emitted
-  3. broadcast is sent when requested
+1. TTL gate (`MSG_TTL_SECONDS`) before mutation.
+2. Signature verification before any state mutation.
+3. Optional envelope decryption for addressed recipient.
+4. Dedup insertion (`seen_messages`) before payload mutation.
+5. Typed mutation by `MessageKind` with duplicate/noop reasons.
 
-- Run / settle
-  1. `seed claim` -> `seed run` -> generate `TaskResult`
-  2. local result is broadcast
-  3. `seed settle` updates status and optionally broadcasts settlement
+This gives concrete rejection/noop outcomes for:
 
-- Sync / idempotency
-  1. `listen` continuously receives envelopes
-  2. `Store::apply_remote` validates TTL and deduplicates by `seen_messages`
-  3. state deltas are applied and persisted
-  4. encrypted envelopes are unwrapped by matching recipient entry before parsing
-  5. `NodeHello` messages populate peer identity table for subsequent encrypted sends
+- expired message
+- duplicate message ids
+- duplicate payload/state transitions
+- not-addressed encrypted envelopes
+- malformed payload shape (hard error)
+- invalid signatures / unknown peer identity (hard error)
 
-## Trust Boundary and Current Risks
+`main` maps these outcomes to monitor events (`store_sync`, `store_sync_noop`, `store_sync_rejected`) with structured payload fields.
 
-- Envelope carries dual signature fields (`ed25519_signature`, `dilithium_signature`) and all
-  non-self remote messages are verified before applying.
-- Sender authentication is bound to `NodeHello` identity exchange; all remote `NodeHello` messages must
-  carry dual signatures before the sender enters peer table.
-- UDP/DHT paths currently remain at risk for replay and rate-limit abuse and rely on this project-local
-  signature validation to reduce unauthenticated injection.
-- Task execution is direct shell execution; no sandboxing or privilege reduction.
-- `Web` and stored state are not protected by authorization for now.
-- Single-file persistence (`state.json`) is vulnerable to concurrent writer races, resolved mostly by last-writer-wins behavior.
+## Message Security Hardening (implemented)
 
-## Post-Quantum Message Security
+- Identity onboarding via signed `NodeHello`.
+- Envelope dual signatures for remote mutation:
+  - Ed25519 (`ed25519_signature`)
+  - Dilithium2 (`dilithium_signature`)
+- Hybrid recipient encryption path:
+  - X25519 ephemeral DH shared secret
+  - Kyber768 encapsulated shared secret
+  - HKDF-SHA256 expansion
+  - ChaCha20-Poly1305 payload encryption
 
-- Handshake and peer identity
-  - Nodes announce identity via `NodeHello` carrying static `x25519`, `kyber`, `ed25519`, and `dilithium` public keys.
-  - `NodeHello` is accepted only when dual signatures validate against declared identity.
+Practical behavior:
 
-- Hybrid session key derivation
-  - For each recipient and each envelope, sender derives a session key from:
-    - X25519 ephemeral ECDH shared secret
-    - Kyber768 encapsulated shared secret
-  - The two shared secrets are concatenated and expanded with `HKDF-SHA256`.
+- Non-`NodeHello` remote messages require known peer identity (or valid attached sender identity).
+- `NodeHello` must match declared identity fields and valid dual signatures.
+- Peer table mutation is apply-time only (not verify-time), covered by store tests.
 
-- Payload protection
-  - Payload is encrypted with `ChaCha20-Poly1305`.
-  - Ciphertext and recipient metadata are stored in `Envelope.crypto`.
-  - Receiver decrypts only the entry addressed to its node id.
+## Transport Resilience Hardening (implemented)
 
-- Authenticity and integrity
-  - Envelope signatures are generated over the full outbound envelope bytes with signature fields cleared.
-  - Dual signature validation (`Ed25519 + Dilithium2`) is required for remote state mutation.
-  - For non-`NodeHello` messages, sender must be known in peer identity table.
+- `dht` publish retries inside DHT worker loop with monitor events for failures.
+- UDP fallback send path for DHT publish failures.
+- Large UDP payload handling:
+  - fragment at fixed chunk size
+  - resend fragments for multiple attempts
+  - reassemble by envelope id
+  - fragment TTL cleanup with drop events
 
-## Reliability and Consistency (current)
+This reduces message loss risk when payload size exceeds single datagram limits.
 
-- `Store::load` / `Store::save` use directory creation and temp-file rename.
-- `state.json` can be raced by multiple instances sharing one directory.
-- Monitor is append-only NDJSON without hard durability and retention policy guarantees.
+## Persistence and Observability Hardening (implemented)
 
-## Backend Hardening Principles (for roadmap)
+- `Store::save` writes `state.json` via:
+  - unique temp file
+  - explicit `sync_all`
+  - atomic rename to target path
+- Web monitor APIs support filtering/limiting (`limit`, `kind`, `source`) and derived topology/overview responses from NDJSON event history.
+- Integration coverage includes two-node UDP and two-node DHT CLI flows (`tests/cli_e2e.rs`).
 
-1. Preserve message semantics first: keep compatibility with existing `MessageKind` and payload shape.
-2. Improve observability and consistency before adding protocol features.
-3. Execution priority order:
-   - trust and authentication controls
-   - persistence durability and conflict recovery
-   - protocol resilience (retry, reject, fallback)
-   - state machine lifecycle correctness
-   - operations visibility (alerts and monitoring)
+## Current Hardening Gaps (still open)
 
-## Key Extension Targets (without breaking behavior)
-
-- Identity and trust policy: add key rotation, revocation, and trust-anchor distribution for peer identities.
-- Sync conflict policy: ordering rules for `seed`, `claim`, and `result` updates are not explicitly versioned.
-- Attack surface: broadcasting paths need source validation and rate controls.
-- Execution safety: no CPU/memory/disk isolation around `runner`.
-- Observability loop: events stay local in NDJSON with no centralized alerting.
+- No API auth gate on `/api/*` (except public `/health`).
+- No transport/source rate limiting on UDP or DHT paths.
+- `seen_messages` is unbounded and TTL value is compile-time constant.
+- Task runner does not enforce allowlist/workdir/output-size limits and timeout path does not force process kill metadata.
+- Multi-process `state.json` writers remain last-writer-wins; no file lock or checksum/backup recovery yet.
+- Monitor NDJSON is append-only without retention policy or centralized alerting.

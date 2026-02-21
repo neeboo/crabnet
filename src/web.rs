@@ -1,8 +1,9 @@
 use crate::monitor::{EventSource, MonitorEvent};
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Query, State},
-    http::StatusCode,
+    extract::{Query, Request, State},
+    http::{header, HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -73,6 +74,87 @@ struct ApiError {
     error: String,
 }
 
+const CRABNET_WEB_API_AUTH_REQUIRED: &str = "CRABNET_WEB_API_AUTH_REQUIRED";
+const CRABNET_WEB_API_TOKEN: &str = "CRABNET_WEB_API_TOKEN";
+const X_API_TOKEN_HEADER: &str = "x-api-token";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ApiAuthConfig {
+    required: bool,
+    token: Option<String>,
+}
+
+impl ApiAuthConfig {
+    fn from_env() -> Self {
+        Self::from_raw(
+            env::var(CRABNET_WEB_API_AUTH_REQUIRED).ok(),
+            env::var(CRABNET_WEB_API_TOKEN).ok(),
+        )
+    }
+
+    fn from_raw(required: Option<String>, token: Option<String>) -> Self {
+        let required = required
+            .as_deref()
+            .map(parse_bool)
+            .unwrap_or(Some(true))
+            .unwrap_or_else(|| {
+                if let Some(raw) = required {
+                    eprintln!(
+                        "invalid {} value `{raw}`, defaulting to protected API mode",
+                        CRABNET_WEB_API_AUTH_REQUIRED
+                    );
+                }
+                true
+            });
+
+        let token = token.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+        Self { required, token }
+    }
+
+    fn is_authorized(&self, headers: &HeaderMap) -> bool {
+        if !self.required {
+            return true;
+        }
+
+        let Some(expected) = self.token.as_deref() else {
+            return false;
+        };
+
+        bearer_token(headers).is_some_and(|token| token == expected)
+            || headers
+                .get(X_API_TOKEN_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|token| token == expected)
+    }
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let mut parts = value.split_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+    if !scheme.eq_ignore_ascii_case("bearer") || parts.next().is_some() {
+        return None;
+    }
+    Some(token)
+}
+
 pub async fn run(listen: &str, state: WebState) -> Result<()> {
     let addr: SocketAddr = listen
         .parse()
@@ -92,26 +174,34 @@ pub async fn run(listen: &str, state: WebState) -> Result<()> {
 }
 
 fn make_router(state: WebState) -> Router {
+    make_router_with_auth(state, ApiAuthConfig::from_env())
+}
+
+fn make_router_with_auth(state: WebState, auth_config: ApiAuthConfig) -> Router {
     let static_root = resolve_static_root();
     eprintln!("web static directory: {}", static_root.display());
 
     let api_router = Router::new()
-        .route("/api/events", get(api_events))
-        .route("/api/topology", get(api_topology))
-        .route("/api/overview", get(api_overview))
+        .route("/events", get(api_events))
+        .route("/topology", get(api_topology))
+        .route("/overview", get(api_overview))
+        .route_layer(middleware::from_fn_with_state(auth_config, api_auth_guard));
+
+    let app = Router::new()
+        .nest("/api", api_router)
         .route("/health", get(health))
         .with_state(state);
 
     let index_file = static_root.join("index.html");
     if static_root.exists() && static_root.is_dir() && index_file.exists() {
         let serve_dir = ServeDir::new(static_root).not_found_service(ServeFile::new(index_file));
-        api_router.fallback_service(serve_dir)
+        app.fallback_service(serve_dir)
     } else {
         eprintln!(
             "web static directory or index.html missing, fallback to built-in status page: {}",
             static_root.display()
         );
-        api_router.route("/", get(index_page))
+        app.route("/", get(index_page))
     }
 }
 
@@ -182,6 +272,24 @@ async fn health() -> &'static str {
 
 async fn index_page() -> impl IntoResponse {
     (StatusCode::OK, include_str!("../web/index.html"))
+}
+
+async fn api_auth_guard(
+    State(auth): State<ApiAuthConfig>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if auth.is_authorized(request.headers()) {
+        return next.run(request).await;
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ApiError {
+            error: "unauthorized".to_string(),
+        }),
+    )
+        .into_response()
 }
 
 async fn api_events(State(state): State<WebState>, Query(query): Query<EventQuery>) -> Response {
@@ -493,9 +601,11 @@ async fn read_events(path: PathBuf, query: EventQuery) -> Result<Vec<MonitorEven
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_topology, EventQuery, WebState};
+    use super::{make_router_with_auth, parse_topology, ApiAuthConfig, EventQuery, WebState};
     use crate::monitor::{EventSource, MonitorEvent};
+    use axum::http::{HeaderMap, HeaderValue};
     use serde_json::json;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn ts() -> u64 {
@@ -609,5 +719,56 @@ mod tests {
         assert_eq!(resp.len(), 2);
         assert_eq!(resp[0].ts, 102);
         assert_eq!(resp[1].ts, 103);
+    }
+
+    #[test]
+    fn auth_config_defaults_to_protected() {
+        let config = ApiAuthConfig::from_raw(None, None);
+        assert!(config.required);
+        assert_eq!(config.token, None);
+    }
+
+    #[test]
+    fn api_rejects_unauthorized_by_default() {
+        let config = ApiAuthConfig::from_raw(None, None);
+        let headers = HeaderMap::new();
+        assert!(!config.is_authorized(&headers));
+    }
+
+    #[test]
+    fn api_accepts_bearer_token() {
+        let config = ApiAuthConfig::from_raw(None, Some("secret-token".into()));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer secret-token"),
+        );
+        assert!(config.is_authorized(&headers));
+    }
+
+    #[test]
+    fn api_accepts_x_api_token() {
+        let config = ApiAuthConfig::from_raw(None, Some("secret-token".into()));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-token", HeaderValue::from_static("secret-token"));
+        assert!(config.is_authorized(&headers));
+    }
+
+    #[test]
+    fn api_can_be_configured_open_via_env_flag() {
+        let config = ApiAuthConfig::from_raw(Some("false".into()), None);
+        let headers = HeaderMap::new();
+        assert!(config.is_authorized(&headers));
+    }
+
+    #[tokio::test]
+    async fn health_is_public_when_api_is_protected() {
+        let _ = make_router_with_auth(
+            WebState {
+                monitor_path: PathBuf::from("unused.ndjson"),
+            },
+            ApiAuthConfig::from_raw(None, None),
+        );
+        assert_eq!(super::health().await, "ok");
     }
 }
