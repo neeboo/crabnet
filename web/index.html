@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Crabnet Monitor</title>
+    <style>
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: #050f21;
+        color: #e6efff;
+        font-family: Inter, 'Segoe UI', sans-serif;
+      }
+      .card {
+        max-width: 520px;
+        border: 1px solid #2b4373;
+        border-radius: 12px;
+        padding: 18px;
+        background: #081d4c;
+      }
+      a {
+        color: #7f98ff;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Crabnet Monitor</h1>
+      <p>The bundled web frontend was not found in this running mode.</p>
+      <p>Run the frontend separately in dev mode:</p>
+      <pre>cd web/app && npm install && npm run dev</pre>
+      <p>Or build it and make it available under <code>web/app/dist</code>.</p>
+      <p>API endpoints: <a href="/api/overview">/api/overview</a>, <a href="/api/topology">/api/topology</a>, <a href="/api/events">/api/events</a>.</p>
+    </div>
+  </body>
+</html>
