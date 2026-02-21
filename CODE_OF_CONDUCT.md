@@ -1,22 +1,18 @@
 # Code of Conduct
 
-## Our Pledge
+## Our Standards
 
-We are committed to creating a welcoming environment for all contributors.
-
-## Standards
-
-- Be respectful and professional in all project spaces.
-- Critique ideas and code, not people.
-- Be constructive and clear when reviewing or requesting changes.
-- Keep discussions focused on technical merits and project goals.
+- Be respectful and professional.
+- Focus feedback on ideas and code.
+- Keep discussions constructive.
+- Report harmful behavior to project maintainers.
 
 ## Unacceptable Behavior
 
-- Harassment, discriminatory language, or personal attacks.
-- Threats, doxxing, or any form of hostility.
-- Persistent trolling or intentionally disruptive behavior.
+- Harassment, abuse, or discriminatory language
+- Personal attacks or intentional disruption
+- Threats or doxxing
 
 ## Enforcement
 
-Project maintainers may remove content or contributors that violate this code of conduct.
+Project maintainers will enforce this policy and may remove access or content that violates it.

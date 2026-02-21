@@ -4,18 +4,16 @@
 
 If you discover a security vulnerability, please report it privately before opening a public issue.
 
-- Contact the maintainers via project maintainers channel.
-- Include: steps to reproduce, impact, and proof-of-concept if available.
-
-We will acknowledge your report within 72 hours and provide a likely timeline after triage.
+- Contact the project maintainers directly.
+- Include steps to reproduce, affected version, impact, and proof-of-concept details if available.
 
 ## Scope
 
-- Core networking and message propagation logic
-- Local state persistence and task result handling
-- Web API and monitor endpoints
+- Networking and message propagation logic
+- Persistent state and task results
+- Web API and monitoring endpoints
 
-## Responsible Disclosure
+## Response
 
-Please allow a reasonable period for fixes before public disclosure.
-Avoid causing service disruption while testing.
+We will acknowledge reports within 72 hours and provide a triage timeline shortly after.
+We ask that you avoid causing service disruption while validating potential issues.
